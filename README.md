@@ -46,30 +46,30 @@ MassTransit.Hackathon/
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    .NET 8 Console App                        │
-│                                                              │
+┌─────────────────────────────────────────────────────────────┐
+│                    .NET 8 Console App                       │
+│                                                             │
 │  ┌─────────────────────────┐   ┌────────────────────────┐   │
-│  │  HelloPublisherWorker   │   │     HelloConsumer       │   │
+│  │  HelloPublisherWorker   │   │     HelloConsumer      │   │
 │  │  (BackgroundService)    │   │  (IConsumer<IHello…>)  │   │
 │  │                         │   │                        │   │
 │  │  Publish every 5 s ──►──┼───┼──► Log received msg    │   │
 │  └─────────────────────────┘   └────────────────────────┘   │
-│              │                            ▲                  │
-│              │        MassTransit Bus     │                  │
-└──────────────┼────────────────────────────┼──────────────────┘
+│              │                            ▲                 │
+│              │        MassTransit Bus     │                 │
+└──────────────┼────────────────────────────┼─────────────────┘
                │                            │
                ▼                            │
-┌──────────────────────────────────────────────────────────────┐
-│                  RabbitMQ (Docker)                           │
-│                                                              │
-│  Exchange: MassTransit.Hackathon:IHelloMessage (fanout)      │
-│  Queue:    hello-consumer                                    │
-│                                                              │
-│  AMQP  → localhost:5672                                      │
-│  UI    → localhost:15672  (guest / guest)                    │
-└──────────────────────────────────────────────────────────────┘
-```
+┌─────────────────────────────────────────────────────────────┐
+│                  RabbitMQ (Docker)                          │
+│                                                             │
+│  Exchange: MassTransit.Hackathon:IHelloMessage (fanout)     │
+│  Queue:    hello-consumer                                   │
+│                                                             │
+│  AMQP  → localhost:5672                                     │
+│  UI    → localhost:15672  (guest / guest)                   │
+└─────────────────────────────────────────────────────────────┘
+``` 
 
 ---
 

@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Dashboard (F5)",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/MassTransit.Hackathon.Dashboard/bin/Debug/net8.0/MassTransit.Hackathon.Dashboard.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/MassTransit.Hackathon.Dashboard",
+            "console": "integratedTerminal",
+            "stopAtEntry": false
+        },
+        {
+            "name": "Worker (standalone)",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/MassTransit.Hackathon/bin/Debug/net8.0/MassTransit.Hackathon.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/MassTransit.Hackathon",
+            "console": "integratedTerminal",
+            "stopAtEntry": false
+        }
+    ]
+}
