@@ -1,33 +1,42 @@
-# MassTransit 101 — How It Really Works
+# MassTransit 101 — Presentation Guide
 
-> A practical explanation of what happens in the code and what you see in the RabbitMQ UI.
-
----
-
-## The Big Picture
-
-Think of **RabbitMQ** as a restaurant pass-through window. The waiter takes orders and calls them out; the kitchen staff each handle what's relevant to their role. **MassTransit** is the ticketing system — it handles all the routing, serialization, and retries so you only write business logic.
-
-```
-WaiterPublisherWorker
-  │
-  │  Publish<IOrderMessage>({ Item = OrderItem.Burger, PlacedAt = now })
-  │
-  ▼
-[RabbitMQ Exchange]  MassTransit.Hackathon.Messages:IOrderMessage  (fanout)
-  │
-  │  fanout → all bound queues
-  │
-  ├──► [Queue]  bartender-consumer   →  BartenderConsumer.Consume()   (handles Soda only)
-  ├──► [Queue]  line-cook-consumer   →  LineCookConsumer.Consume()    (handles Burger & Fries)
-  └──► [Queue]  manager-consumer     →  ManagerConsumer.Consume()     (observes everything)
-```
+> A walkthrough for presenting RabbitMQ, MassTransit, and the Hackathon project.
 
 ---
 
-## The Three Code Pieces
+## What Is RabbitMQ? (TLDR for Devs)
 
-### 1 — The Message Contract (`IOrderMessage`)
+**RabbitMQ** is an open-source **message broker** — a middleman that receives, stores, and forwards messages between applications.
+
+- Think of it as a **post office**: your app drops off a letter (message), RabbitMQ holds it in a mailbox (queue), and the recipient picks it up when ready.
+- It speaks **AMQP** (Advanced Message Queuing Protocol) — a standard wire protocol for messaging.
+- It gives you **durability** (messages survive broker restarts), **decoupling** (publishers and consumers don't need to know each other), and **buffering** (handles bursts of traffic).
+- It comes with a **Management UI** on port `15672` to inspect everything in real time.
+
+**One-liner:** RabbitMQ is the pipe between your services — it makes sure messages get from A to B reliably, even if B is temporarily down.
+
+---
+
+## What Is MassTransit? (TLDR for Devs)
+
+**MassTransit** is an open-source **.NET library** that sits on top of message brokers (RabbitMQ, Azure Service Bus, Amazon SQS, etc.) and removes all the plumbing.
+
+- Without MassTransit you'd write raw AMQP code: declare exchanges, bind queues, serialize JSON, handle acks/nacks, manage retries…
+- With MassTransit you write **C# interfaces** for messages and **classes** for consumers — it handles the rest.
+- It auto-creates the RabbitMQ topology (exchanges, queues, bindings) from your code at startup.
+- Built-in support for **retries**, **circuit breakers**, **sagas**, **outbox patterns**, and **testing harnesses**.
+
+**One-liner:** MassTransit is the "Entity Framework of messaging" — you write business logic, it talks to the broker for you.
+
+---
+
+## Message, Publisher, Consumer
+
+These are the three core building blocks you'll work with.
+
+### The Message
+
+A message is a **plain data contract** — an interface or class that defines what travels on the wire.
 
 ```csharp
 public interface IOrderMessage
@@ -39,145 +48,88 @@ public interface IOrderMessage
 public enum OrderItem { Burger, Fries, Soda }
 ```
 
-This interface defines the **envelope shape** — what data travels on the wire. It has no behavior, just a schema.
+- No behavior, just a **schema** (the shape of the envelope).
+- MassTransit uses the **fully-qualified type name** as the RabbitMQ exchange name (e.g. `MassTransit.Hackathon.Messages:IOrderMessage`).
 
-**What MassTransit does with it:** it uses the fully-qualified type name as the name of a RabbitMQ **Exchange**.
+### The Publisher
 
-> **RabbitMQ UI → Exchanges tab:** you'll see an exchange named  
-> `MassTransit.Hackathon.Messages:IOrderMessage` of type **fanout**.
-
----
-
-### 2 — Startup & Wiring (`Program.cs`)
-
-```csharp
-services.AddMassTransit(x =>
-{
-    x.AddConsumer<BartenderConsumer>();   // Handles Soda orders
-    x.AddConsumer<LineCookConsumer>();    // Handles Burger & Fries orders
-    x.AddConsumer<ManagerConsumer>();     // Observes all orders
-    x.UsingRabbitMq((context, cfg) => {
-        cfg.Host("localhost", ...);
-        cfg.ConfigureEndpoints(context);  // Auto-create queues + bindings
-    });
-});
-```
-
-When the app **starts**, MassTransit connects to RabbitMQ and declares the topology:
-
-1. Creates the **exchange** `MassTransit.Hackathon.Messages:IOrderMessage` (fanout)
-2. Creates **queues** named `bartender-consumer`, `line-cook-consumer`, and `manager-consumer` (derived from consumer class names by convention)
-3. **Binds** all three queues to the exchange
-
-> **RabbitMQ UI — what appears on startup:**
-> | Tab | What you see |
-> |-----|-------------|
-> | Connections | 1 connection from your app |
-> | Channels | 1–2 channels (one for publishing, one for consuming) |
-> | Exchanges | The new `IOrderMessage` fanout exchange |
-> | Queues | `bartender-consumer`, `line-cook-consumer`, `manager-consumer` each with 1 consumer |
-
----
-
-### 3 — Publishing (`WaiterPublisherWorker`)
+The publisher is the code that **sends messages** into the broker.
 
 ```csharp
 await _publishEndpoint.Publish<IOrderMessage>(
     new { Item = item, PlacedAt = DateTime.UtcNow });
 ```
 
-`Publish<T>` tells MassTransit: *"broadcast this order to everyone who handles `IOrderMessage`"*.
+- The publisher doesn't know (or care) who will receive the message.
+- MassTransit serializes the object to **JSON** and pushes it to the appropriate RabbitMQ **exchange**.
 
-Under the hood it:
-1. Serializes the anonymous object into JSON (it satisfies `IOrderMessage` by shape)
-2. Sends the JSON to the **`IOrderMessage` exchange** in RabbitMQ
+### The Consumer
 
-Because the exchange is **fanout**, it immediately fans the order out to every bound queue — `bartender-consumer`, `line-cook-consumer`, and `manager-consumer` all receive a copy simultaneously. **No changes to the waiter needed** if you add more kitchen staff.
-
-> **RabbitMQ UI → Exchanges → click `IOrderMessage`:** the "Bindings" section shows all three consumer queues bound. The message rate graph ticks with each order placed.
-
----
-
-### 4 — Consuming (`BartenderConsumer`, `LineCookConsumer`, `ManagerConsumer`)
-
-Each consumer receives every `IOrderMessage` from its own dedicated queue, but filters based on its role:
+The consumer is a class that **reacts to messages** when they arrive.
 
 ```csharp
-// BartenderConsumer — only handles Soda
-public Task Consume(ConsumeContext<IOrderMessage> context)
+public class ManagerConsumer : IConsumer<IOrderMessage>
 {
-    if (context.Message.Item != OrderItem.Soda) return Task.CompletedTask;
-    _logger.LogInformation("[Bartender] Poured {Item} (ordered at {PlacedAt:O})",
-        context.Message.Item, context.Message.PlacedAt);
-    return Task.CompletedTask;
-}
-
-// LineCookConsumer — handles Burger & Fries
-public Task Consume(ConsumeContext<IOrderMessage> context)
-{
-    if (context.Message.Item == OrderItem.Soda) return Task.CompletedTask;
-    _logger.LogInformation("[LineCook] Cooked {Item} (ordered at {PlacedAt:O})",
-        context.Message.Item, context.Message.PlacedAt);
-    return Task.CompletedTask;
-}
-
-// ManagerConsumer — observes everything
-public Task Consume(ConsumeContext<IOrderMessage> context)
-{
-    _logger.LogInformation("[Manager] Saw order → {Item} (placed at {PlacedAt:O})",
-        context.Message.Item, context.Message.PlacedAt);
-    return Task.CompletedTask;
+    public Task Consume(ConsumeContext<IOrderMessage> context)
+    {
+        _logger.LogInformation("[Manager] Saw order → {Item}", context.Message.Item);
+        return Task.CompletedTask;
+    }
 }
 ```
 
-MassTransit keeps a long-lived channel **subscribed to each consumer's queue**. When a message lands:
+Under the hood:
+1. MassTransit keeps a long-lived channel **subscribed** to the consumer's queue.
+2. When a message arrives → it **deserializes** the JSON back into `IOrderMessage`.
+3. It resolves the consumer from **DI** and calls `Consume()`.
+4. If `Consume()` succeeds → MassTransit **ACKs** the message (RabbitMQ removes it).
+5. If it throws → MassTransit **NACKs** it (RabbitMQ can redeliver or dead-letter it).
 
-1. RabbitMQ delivers it to the channel
-2. MassTransit deserializes the JSON back into `IOrderMessage`
-3. It resolves the consumer from DI and calls `Consume()`
-4. If `Consume()` returns **without throwing** → MassTransit **acks** the message (tells RabbitMQ: done, remove it)
-5. If it **throws** → MassTransit **nacks** it, and RabbitMQ can redeliver or dead-letter it
+### How They Wire Together
 
-> **RabbitMQ UI → Queues → e.g. `bartender-consumer`:**
-> | Column | Meaning |
-> |--------|---------|
-> | Ready | Messages sitting unprocessed (stays near 0 — consumers are fast) |
-> | Unacked | Messages being processed right now (briefly 1) |
-> | Consumers | 1 (your running app) |
+```
+Publisher (Waiter)
+  │
+  │  Publish<IOrderMessage>
+  ▼
+[Exchange]  IOrderMessage  (fanout)
+  │
+  ├──► [Queue] bartender-consumer  →  BartenderConsumer.Consume()
+  ├──► [Queue] line-cook-consumer  →  LineCookConsumer.Consume()
+  └──► [Queue] manager-consumer    →  ManagerConsumer.Consume()
+```
+
+All of this topology is **auto-created** by MassTransit at startup via `ConfigureEndpoints`.
 
 ---
 
-## Exchange Types and Alternatives to Fanout
-
-RabbitMQ supports four exchange types. MassTransit chooses **fanout** for `Publish<T>`, but understanding the others helps you know *why*.
+## Fanout vs. Alternatives (Publish vs. Send)
 
 ### The Four RabbitMQ Exchange Types
 
-| Exchange Type | Routing Logic | RabbitMQ UI label |
+| Exchange Type | Routing Logic | When to use |
 |---|---|---|
-| **fanout** | Delivers to **all** bound queues, no conditions | `fanout` |
-| **direct** | Delivers to queues whose binding key **exactly matches** the routing key | `direct` |
-| **topic** | Delivers to queues whose binding key **pattern-matches** the routing key (`*` = one word, `#` = zero or more) | `topic` |
-| **headers** | Delivers based on **message header attributes** instead of a routing key | `headers` |
+| **fanout** | Delivers to **all** bound queues — no conditions | Broadcast events to every subscriber |
+| **direct** | Delivers to queues whose binding key **exactly matches** the routing key | Route to a specific queue by key |
+| **topic** | Delivers using **pattern matching** (`*` = one word, `#` = zero or more) | Flexible routing (e.g. `orders.food.*`) |
+| **headers** | Routes based on **message header attributes** instead of routing key | Complex multi-attribute routing |
 
-### Why MassTransit Uses Fanout
+### Why MassTransit Defaults to Fanout
 
-When you call `Publish<IOrderMessage>()`, MassTransit's goal is **broadcast**: every service that cares about `IOrderMessage` should get a copy independently. Fanout achieves this with zero routing logic — every bound queue gets the message, period.
+When you call `Publish<IOrderMessage>()`, the goal is **broadcast** — every service that cares about `IOrderMessage` gets a copy. Fanout does this with zero routing logic.
 
 ```
 Exchange: IOrderMessage (fanout)
-  ├──► queue: bartender-consumer    (BartenderConsumer — handles Soda)
-  ├──► queue: line-cook-consumer    (LineCookConsumer  — handles Burger & Fries)
-  └──► queue: manager-consumer      (ManagerConsumer   — observes all orders)
+  ├──► queue: bartender-consumer    (handles Soda)
+  ├──► queue: line-cook-consumer    (handles Burger & Fries)
+  └──► queue: manager-consumer      (observes everything)
 ```
 
-Each consumer gets its **own queue** and processes at its own pace — they are fully decoupled from each other and from the waiter.
+Add a new consumer? Just register it — MassTransit auto-binds a new queue on startup. The publisher doesn't change.
 
-> In the RabbitMQ UI → **Exchanges → `IOrderMessage` → Bindings**: every time you register a new `IConsumer<IOrderMessage>` and run the app, a new queue appears in that list automatically (thanks to `ConfigureEndpoints`).
+### What MassTransit Actually Creates
 
-### What MassTransit Actually Creates (Two Exchanges)
-
-When you look at the Exchanges tab you'll notice MassTransit creates **two** exchanges per message type, not one:
+You'll notice **two layers** of exchanges in the RabbitMQ UI:
 
 ```
 MassTransit.Hackathon.Messages:IOrderMessage   (fanout)   ← publish target
@@ -186,61 +138,117 @@ line-cook-consumer                             (fanout)   ← per-queue exchange
 manager-consumer                               (fanout)   ← per-queue exchange
 ```
 
-The per-queue exchange acts as an indirection layer. This allows MassTransit to send a message **directly to one specific consumer** (via `Send`) while still supporting the full publish/subscribe topology. You don't need to manage either exchange manually.
+The per-queue exchanges are an **indirection layer** that lets MassTransit `Send` a message directly to one specific consumer while still supporting full publish/subscribe.
 
----
-
-## Publish vs. Send — Key Distinction
+### Publish vs. Send
 
 | | `Publish<T>` | `Send` |
 |--|--|--|
-| **Routes to** | Exchange → all bound queues | Specific queue directly |
-| **Coupling** | Publisher doesn't know who's listening | Publisher must know the queue name |
-| **Exchange used** | The message-type fanout exchange | The per-queue exchange (or queue directly) |
+| **Semantics** | "Something happened" (event) | "Do this" (command) |
+| **Routes to** | Exchange → **all** bound queues | One **specific** queue |
+| **Coupling** | Publisher doesn't know who's listening | Publisher must know the queue address |
+| **Exchange used** | The message-type fanout exchange | The per-queue exchange |
 | **Use when** | Broadcasting events | Commanding a specific endpoint |
 
 ```csharp
-// Publish — broadcast the order to all kitchen staff
-await _publishEndpoint.Publish<IOrderMessage>(new { Item = item, PlacedAt = DateTime.UtcNow });
+// Publish — broadcast to all kitchen staff
+await _publishEndpoint.Publish<IOrderMessage>(
+    new { Item = item, PlacedAt = DateTime.UtcNow });
 
-// Send — targeted directly to one specific station
-await _sendEndpoint.Send<IOrderMessage>(new { Item = item, PlacedAt = DateTime.UtcNow },
+// Send — target one specific station
+var endpoint = await _sendEndpointProvider.GetSendEndpoint(
     new Uri("queue:bartender-consumer"));
+await endpoint.Send<IOrderMessage>(
+    new { Item = item, PlacedAt = DateTime.UtcNow });
 ```
 
-MassTransit's `ConfigureEndpoints` auto-creates and wires queues for every registered consumer, so you never manage bindings manually when using `Publish`.
+**Rule of thumb:** Use `Publish` for **events** ("OrderPlaced"), use `Send` for **commands** ("CookBurger").
 
 ---
 
-## What the RabbitMQ UI Tabs Actually Show
+## RabbitMQ Management UI
 
-| UI Tab | What you're seeing |
-|--------|--------------------|
-| **Overview** | Total message rates across the whole broker |
-| **Connections** | Each `dotnet run` = 1 TCP connection |
-| **Channels** | Lightweight virtual connections within 1 TCP connection. MassTransit uses one per operation type |
-| **Exchanges** | The fanout exchange MassTransit created for `IOrderMessage` |
-| **Queues & Streams** | `bartender-consumer`, `line-cook-consumer`, `manager-consumer` — orders land here, consumers drain them |
+Open [http://localhost:15672](http://localhost:15672) — login: `guest` / `guest`.
 
----
+### Overview
 
-## Lifecycle of One Message (End to End)
+The **landing page** of the management UI.
 
-```
-1. App starts
-   └─ MassTransit connects → declares exchange + queues + bindings
-      (bartender-consumer, line-cook-consumer, manager-consumer)
+- **Message rates chart** — global publish, deliver, and acknowledge rates across the entire broker.
+- **Queued messages chart** — total ready + unacked messages across all queues.
+- **Node info** — Erlang version, memory usage, disk space, uptime.
+- **Ports and contexts** — which protocols are active (AMQP 5672, HTTP 15672).
 
-2. WaiterPublisherWorker (every N seconds)
-   └─ Publish<IOrderMessage>()
-      └─ MassTransit serializes to JSON
-         └─ JSON sent to RabbitMQ exchange "IOrderMessage"
-            └─ Exchange fans out to all three consumer queues
+> 💡 This is your "health dashboard" — if message rates flatline or queued messages spike, something's wrong.
 
-3. BartenderConsumer / LineCookConsumer / ManagerConsumer (in parallel)
-   └─ MassTransit receives from each queue
-      └─ Deserializes JSON → IOrderMessage
-         └─ Calls Consume()
-            └─ On success: ACK → message deleted from queue
-            └─ On exception: NACK → message requeued or dead-lettered
-```
+### Connections
+
+Each running application = **one TCP connection** to RabbitMQ.
+
+| Column | Meaning |
+|--------|---------|
+| **Name** | Client IP and port |
+| **User name** | The AMQP user (e.g. `guest`) |
+| **State** | `running` = healthy |
+| **Channels** | Number of channels inside this connection |
+| **Send / Receive rate** | Bytes per second in each direction |
+
+> 💡 When you `dotnet run` the hackathon app, you'll see **1 connection** appear here. Stop the app → it disappears.
+
+### Channels
+
+Channels are **lightweight virtual connections** multiplexed inside one TCP connection.
+
+| Column | Meaning |
+|--------|---------|
+| **Channel** | Identifier (e.g. `connection:1 channel:1`) |
+| **Consumer count** | How many queues this channel is subscribed to |
+| **Prefetch** | How many unacked messages the channel can hold at once |
+| **Unacked** | Messages currently being processed |
+
+MassTransit typically opens **one channel per consumer** plus one for publishing.
+
+> 💡 If you have 3 consumers, expect ~4 channels (3 consuming + 1 publishing).
+
+### Exchanges
+
+An exchange is the **routing layer** — it receives messages and routes them to queues based on its type and bindings.
+
+| Column | Meaning |
+|--------|---------|
+| **Name** | Exchange name (MassTransit uses the full type name for message exchanges) |
+| **Type** | `fanout`, `direct`, `topic`, or `headers` |
+| **Bindings** | Click an exchange to see which queues (or other exchanges) it routes to |
+| **Message rate in** | Messages per second arriving at this exchange |
+
+What you'll see in this hackathon:
+- `MassTransit.Hackathon.Messages:IOrderMessage` — the **fanout exchange** for order messages
+- `bartender-consumer`, `line-cook-consumer`, `manager-consumer` — **per-queue exchanges** created by MassTransit
+
+> 💡 Click on the `IOrderMessage` exchange → the **Bindings** section shows all consumer queues bound to it.
+
+### Queues and Streams
+
+Queues are where messages **wait to be consumed**. Each consumer gets its own queue.
+
+| Column | Meaning |
+|--------|---------|
+| **Name** | Queue name (MassTransit derives it from the consumer class name) |
+| **Type** | `classic` or `quorum` |
+| **Ready** | Messages sitting in the queue, waiting to be picked up |
+| **Unacked** | Messages delivered to a consumer but not yet acknowledged |
+| **Total** | Ready + Unacked |
+| **Consumers** | Number of consumer instances subscribed to this queue |
+| **Message rate** | Incoming and delivery rates |
+
+What you'll see:
+- `bartender-consumer` — drains Soda orders
+- `line-cook-consumer` — drains Burger & Fries orders
+- `manager-consumer` — observes all orders
+
+> 💡 **Ready** stays near 0 when consumers are healthy. If it climbs, consumers are falling behind. **Unacked** briefly shows 1 while a message is being processed.
+
+Click on a queue to see:
+- **Bindings** — which exchanges feed into this queue
+- **Get messages** — peek at messages without consuming them (great for debugging!)
+- **Consumers** — details about connected consumer instances

@@ -2,6 +2,23 @@
 
 **Team Name / Dev Name:** _______________________
 
+---
+
+### Step 0: Setup 🛠️
+
+Before diving into the achievements, let's get everything up and running.
+
+| # | What | How | ✅ |
+|---|------|-----|----|
+| 1 | **Start RabbitMQ** — Boot the message broker | `docker-compose up -d` (from the repo root) | ☐ |
+| 2 | **Launch the Hackathon Dashboard** — Start the TUI dashboard | `cd MassTransit.Hackathon.Dashboard && dotnet run` | ☐ |
+| 3 | **Open the RabbitMQ Management UI** — Verify the broker is alive | Navigate to [http://localhost:15672](http://localhost:15672) — login: `guest` / `guest` | ☐ |
+| 4 | **Review the 101 page** — Quick walkthrough of concepts before we start | Open and read through [MASSTRANSIT-101.md](MASSTRANSIT-101.md) | ☐ |
+
+> ✅ Once all four boxes are checked, you're ready to start hacking!
+
+---
+
 ### Tier 1: The Groundwork (Getting Connected)
 - [ ] **1. Hello, Is It Me:** Connect to broker, publish `PingMessage`, and consume it.
 - [ ] **2. A Binding Contract:** Refactor message contract to a C# `interface`.
