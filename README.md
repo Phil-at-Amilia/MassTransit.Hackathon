@@ -187,6 +187,8 @@ Open **[http://localhost:15672](http://localhost:15672)** in your browser.
 | **`ConfigureEndpoints`** | Auto-creates a queue and binding for every registered consumer |
 | **fanout exchange** | RabbitMQ exchange type MassTransit uses for `Publish<T>()` — all bound queues receive every message |
 
+> 📖 Ready for more? Check out [MASSTRANSIT-102.md](MASSTRANSIT-102.md) for **retries, circuit breakers, sagas, transactional outbox, and testing harnesses**.
+
 ---
 
 ## Hackathon Challenges

@@ -14,8 +14,9 @@ Before diving into the achievements, let's get everything up and running.
 | 2 | **Launch the Hackathon Dashboard** — Start the TUI dashboard | `cd MassTransit.Hackathon.Dashboard && dotnet run` | ☐ |
 | 3 | **Open the RabbitMQ Management UI** — Verify the broker is alive | Navigate to [http://localhost:15672](http://localhost:15672) — login: `guest` / `guest` | ☐ |
 | 4 | **Review the 101 page** — Quick walkthrough of concepts before we start | Open and read through [MASSTRANSIT-101.md](MASSTRANSIT-101.md) | ☐ |
+| 5 | **Bookmark the 102 page** — Advanced concepts reference (retries, sagas, outbox, testing) | Skim [MASSTRANSIT-102.md](MASSTRANSIT-102.md) — come back when you hit Tier 2+ | ☐ |
 
-> ✅ Once all four boxes are checked, you're ready to start hacking!
+> ✅ Once all five boxes are checked, you're ready to start hacking!
 
 ---
 
