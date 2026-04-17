@@ -7,6 +7,7 @@ internal enum CommandType
 {
     SpawnConsumer,
     SpawnPublisher,
+    SpawnGroupOrder,
     GracefulStop,
     CrashKill,
     Quit,
@@ -15,7 +16,7 @@ internal enum CommandType
 internal sealed class PendingCommand
 {
     public CommandType Type  { get; }
-    public bool        Slow  { get; }   // true when user pressed lowercase 'c'
+    public bool        Slow  { get; }   // true when user pressed S/s (slow consumer)
 
     public PendingCommand(CommandType type, bool slow = false)
     {
@@ -147,9 +148,10 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
                 PendingCommand? cmd = key.KeyChar switch
                 {
-                    'C'      => new PendingCommand(CommandType.SpawnConsumer, slow: false),
-                    'c'      => new PendingCommand(CommandType.SpawnConsumer, slow: true),
+                    'C' or 'c' => new PendingCommand(CommandType.SpawnConsumer, slow: false),
+                    'S' or 's' => new PendingCommand(CommandType.SpawnConsumer, slow: true),
                     'P' or 'p' => new PendingCommand(CommandType.SpawnPublisher),
+                    'G' or 'g' => new PendingCommand(CommandType.SpawnGroupOrder),
                     'K' or 'k' => new PendingCommand(CommandType.GracefulStop),
                     'X' or 'x' => new PendingCommand(CommandType.CrashKill),
                     'Q' or 'q' => new PendingCommand(CommandType.Quit),
@@ -226,6 +228,24 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
                 break;
             }
 
+            case CommandType.SpawnGroupOrder:
+            {
+                var item = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title("[bold]Select item:[/]")
+                        .AddChoices("burger", "fries", "soda"));
+
+                var count = AnsiConsole.Prompt(
+                    new TextPrompt<int>("[bold]Count?[/]")
+                        .DefaultValue(5)
+                        .Validate(n => n > 0
+                            ? ValidationResult.Success()
+                            : ValidationResult.Error("Must be a positive number")));
+
+                _pm.SpawnGroupOrder(item, count);
+                break;
+            }
+
             case CommandType.GracefulStop:
             case CommandType.CrashKill:
             {
@@ -271,7 +291,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             BuildStatsPanel(),
             BuildLogPanel(),
             new Markup(
-                "\n[grey][[C]][/] Consumer  [grey][[c]][/] SlowConsumer  [grey][[P]][/] Publisher" +
+                "\n[grey][[C]][/] Consumer  [grey][[S]][/] SlowConsumer  [grey][[P]][/] Publisher  [grey][[G]][/] GroupOrder" +
                 "    [grey][[K]][/] Graceful stop  [grey][[X]][/] Crash kill  [grey][[Q]][/] Quit\n"),
         };
 
@@ -296,7 +316,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
         if (processes.Count == 0)
         {
-            table.AddRow(new Markup("[grey italic](no processes — press C, c, or P to spawn one)[/]"));
+            table.AddRow(new Markup("[grey italic](no processes — press C, S, P, or G to spawn one)[/]"));
             return table;
         }
 
@@ -460,10 +480,11 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
     private static string RoleColor(WorkerRole role) => role switch
     {
-        WorkerRole.Publisher => "green",
-        WorkerRole.LineCook  => "cyan",
-        WorkerRole.Bartender => "dodgerblue1",
-        WorkerRole.Manager   => "magenta",
+        WorkerRole.Publisher   => "green",
+        WorkerRole.LineCook    => "cyan",
+        WorkerRole.Bartender   => "dodgerblue1",
+        WorkerRole.Manager     => "magenta",
+        WorkerRole.GroupOrder  => "yellow",
         _ => "grey",
     };
 }

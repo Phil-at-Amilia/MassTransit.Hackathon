@@ -35,8 +35,9 @@ public class BartenderConsumer : IConsumer<IOrderMessage>
         }
 
         _logger.LogInformation(
-            "[{Label}] Poured {Item} (ordered at {PlacedAt:O})",
+            "[{Label}] Poured [{OrderId}] {Item} (ordered at {PlacedAt:O})",
             label,
+            context.Message.OrderId,
             context.Message.Item,
             context.Message.PlacedAt);
     }

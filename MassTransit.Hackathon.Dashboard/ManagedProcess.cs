@@ -8,7 +8,8 @@ internal enum WorkerRole
     LineCook,
     Bartender,
     Manager,
-    Publisher
+    Publisher,
+    GroupOrder,
 }
 
 internal sealed class ManagedProcess

@@ -80,6 +80,14 @@ internal sealed class ProcessManager
         return Spawn(id, WorkerRole.Publisher, label, args, 0, rateSeconds);
     }
 
+    public ManagedProcess SpawnGroupOrder(string item, int count)
+    {
+        var id    = Interlocked.Increment(ref _nextId);
+        var label = $"GroupOrder-{id}";
+        var args  = $"--mode grouporder --label {label} --item {item} --count {count}";
+        return Spawn(id, WorkerRole.GroupOrder, label, args, 0, 0);
+    }
+
     private ManagedProcess Spawn(int id, WorkerRole role, string label, string args, int slowMs, int rateSeconds)
     {
         var psi = new ProcessStartInfo(_workerExe, _workerArgPrefix + args)

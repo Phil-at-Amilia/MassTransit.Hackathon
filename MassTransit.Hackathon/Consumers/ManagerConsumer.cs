@@ -27,8 +27,9 @@ public class ManagerConsumer : IConsumer<IOrderMessage>
             await Task.Delay(_options.SlowMs, context.CancellationToken);
 
         _logger.LogInformation(
-            "[{Label}] Saw order → {Item} (placed at {PlacedAt:O})",
+            "[{Label}] Saw order [{OrderId}] → {Item} (placed at {PlacedAt:O})",
             label,
+            context.Message.OrderId,
             context.Message.Item,
             context.Message.PlacedAt);
     }

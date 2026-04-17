@@ -7,6 +7,9 @@ namespace MassTransit.Hackathon.Messages;
 /// </summary>
 public interface IOrderMessage
 {
+    /// <summary>Unique 5-character order identifier (uppercase hex).</summary>
+    string OrderId { get; }
+
     /// <summary>The item being ordered.</summary>
     OrderItem Item { get; }
 

@@ -41,14 +41,15 @@ public class WaiterPublisherWorker : BackgroundService
         while (!stoppingToken.IsCancellationRequested)
         {
             var item = Menu[Random.Shared.Next(Menu.Length)];
-
-            await _publishEndpoint.Publish<IOrderMessage>(
-                new { Item = item, PlacedAt = DateTime.UtcNow },
-                stoppingToken);
+            var orderId = Guid.NewGuid().ToString("N")[..5].ToUpper();
 
             _logger.LogInformation(
-                "[{Label}] Placed order: {Item} at {Time:O}",
-                label, item, DateTime.UtcNow);
+                "[{Label}] Placed order [{OrderId}]: {Item} at {Time:O}",
+                label, orderId, item, DateTime.UtcNow);
+
+            await _publishEndpoint.Publish<IOrderMessage>(
+                new { OrderId = orderId, Item = item, PlacedAt = DateTime.UtcNow },
+                stoppingToken);
 
             await Task.Delay(interval, stoppingToken);
         }

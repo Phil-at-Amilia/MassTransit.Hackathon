@@ -20,6 +20,12 @@ public class WorkerOptions
     /// <summary>Short label prepended to log messages, e.g. "Cook-1"</summary>
     public string Label { get; set; } = "";
 
+    /// <summary>Item type for group-order mode (burger | fries | soda)</summary>
+    public string Item { get; set; } = "";
+
+    /// <summary>Number of orders to publish in group-order mode</summary>
+    public int Count { get; set; } = 0;
+
     public static WorkerOptions Parse(string[] args)
     {
         var opts = new WorkerOptions();
@@ -41,6 +47,12 @@ public class WorkerOptions
                     break;
                 case "--label" when i + 1 < args.Length:
                     opts.Label = args[++i];
+                    break;
+                case "--item" when i + 1 < args.Length:
+                    opts.Item = args[++i].ToLowerInvariant();
+                    break;
+                case "--count" when i + 1 < args.Length:
+                    opts.Count = int.TryParse(args[++i], out var n) ? Math.Max(0, n) : 0;
                     break;
             }
         }

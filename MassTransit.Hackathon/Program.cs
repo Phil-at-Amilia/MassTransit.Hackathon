@@ -17,6 +17,7 @@ Console.InputEncoding  = System.Text.Encoding.UTF8;
 //   dotnet run -- --mode consumer --type bartender --slow 3000   → slow Bartender (crash test)
 //   dotnet run -- --mode publisher --rate 2             → publisher only, 2-second interval
 //   dotnet run -- --mode consumer --type manager --label Manager-1
+//   dotnet run -- --mode grouporder                                  → one-shot group publisher (interactive)
 
 var options = WorkerOptions.Parse(args);
 
@@ -63,6 +64,9 @@ await Host.CreateDefaultBuilder(args)
 
         if (options.Mode is "all" or "publisher")
             services.AddHostedService<WaiterPublisherWorker>();
+
+        if (options.Mode == "grouporder")
+            services.AddHostedService<GroupOrderPublisherWorker>();
 
         // Always register — is a no-op when stdin is not redirected
         services.AddHostedService<StdinShutdownMonitor>();

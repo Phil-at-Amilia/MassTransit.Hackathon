@@ -35,8 +35,9 @@ public class LineCookConsumer : IConsumer<IOrderMessage>
         }
 
         _logger.LogInformation(
-            "[{Label}] Cooked {Item} (ordered at {PlacedAt:O})",
+            "[{Label}] Cooked [{OrderId}] {Item} (ordered at {PlacedAt:O})",
             label,
+            context.Message.OrderId,
             context.Message.Item,
             context.Message.PlacedAt);
     }
