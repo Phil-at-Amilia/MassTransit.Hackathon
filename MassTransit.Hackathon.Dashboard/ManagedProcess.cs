@@ -24,6 +24,9 @@ internal sealed class ManagedProcess
 
     public bool IsRunning => !SystemProcess.HasExited;
 
+    /// <summary>True while a "pause" command has been sent and "resume" has not yet been sent.</summary>
+    public bool IsPaused { get; set; }
+
     /// <summary>Rolling log buffer for this process (last 100 lines).</summary>
     public ConcurrentQueue<string> LogBuffer { get; } = new();
 }

@@ -10,6 +10,7 @@ internal enum CommandType
     SpawnGroupOrder,
     GracefulStop,
     CrashKill,
+    PauseToggle,
     Quit,
 }
 
@@ -154,6 +155,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
                     'G' or 'g' => new PendingCommand(CommandType.SpawnGroupOrder),
                     'K' or 'k' => new PendingCommand(CommandType.GracefulStop),
                     'X' or 'x' => new PendingCommand(CommandType.CrashKill),
+                    'Z' or 'z' => new PendingCommand(CommandType.PauseToggle),
                     'Q' or 'q' => new PendingCommand(CommandType.Quit),
                     _ => null,
                 };
@@ -247,34 +249,87 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             }
 
             case CommandType.GracefulStop:
+            {
+                // Only consumers and publishers support graceful stop via stdin close.
+                // GroupOrder workers exit on their own after publishing. The dashboard
+                // itself is never in this list.
+                var stoppable = _pm.Snapshot()
+                    .Where(p => p.IsRunning && p.Role != WorkerRole.GroupOrder)
+                    .ToList();
+
+                if (stoppable.Count == 0)
+                {
+                    AnsiConsole.MarkupLine("[yellow]No running consumers or publishers to stop.[/]");
+                    await Task.Delay(1200);
+                    break;
+                }
+
+                // Build a dictionary keyed by display label so we don't need to
+                // parse the selected string (and avoid Spectre markup bracket conflicts).
+                var choiceMap = stoppable.ToDictionary(
+                    p => $"#{p.Id}  {p.Label}  ({p.Role})"
+                       + (p.SlowMs > 0 ? $"  slow={p.SlowMs}ms" : ""),
+                    p => p);
+
+                var choice = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title("[bold]Graceful stop — select process:[/]")
+                        .AddChoices(choiceMap.Keys));
+
+                _pm.GracefulStop(choiceMap[choice].Id);
+                break;
+            }
+
             case CommandType.CrashKill:
             {
                 var running = _pm.Snapshot().Where(p => p.IsRunning).ToList();
                 if (running.Count == 0)
                 {
-                    AnsiConsole.MarkupLine("[yellow]No running processes to stop.[/]");
+                    AnsiConsole.MarkupLine("[yellow]No running processes to kill.[/]");
                     await Task.Delay(1200);
                     break;
                 }
 
-                var title = cmd.Type == CommandType.GracefulStop
-                    ? "[bold]Graceful stop — select process:[/]"
-                    : "[bold red]CRASH KILL — select process:[/]";
-
-                var choices = running
-                    .Select(p => $"[{p.Id}] {p.Label} ({p.Role}){(p.SlowMs > 0 ? $" slow={p.SlowMs}ms" : "")}")
-                    .ToList();
+                var choiceMap = running.ToDictionary(
+                    p => $"#{p.Id}  {p.Label}  ({p.Role})"
+                       + (p.SlowMs > 0 ? $"  slow={p.SlowMs}ms" : ""),
+                    p => p);
 
                 var choice = AnsiConsole.Prompt(
-                    new SelectionPrompt<string>().Title(title).AddChoices(choices));
+                    new SelectionPrompt<string>()
+                        .Title("[bold red]CRASH KILL — select process:[/]")
+                        .AddChoices(choiceMap.Keys));
 
-                var selectedId = int.Parse(choice.Split(']')[0].TrimStart('['));
+                _pm.CrashKill(choiceMap[choice].Id);
+                break;
+            }
 
-                if (cmd.Type == CommandType.GracefulStop)
-                    _pm.GracefulStop(selectedId);
-                else
-                    _pm.CrashKill(selectedId);
+            case CommandType.PauseToggle:
+            {
+                // Only consumers can be paused — publishers have no Consume() logic.
+                var consumers = _pm.Snapshot()
+                    .Where(p => p.IsRunning
+                             && p.Role is WorkerRole.LineCook or WorkerRole.Bartender or WorkerRole.Manager)
+                    .ToList();
 
+                if (consumers.Count == 0)
+                {
+                    AnsiConsole.MarkupLine("[yellow]No running consumers to pause/resume.[/]");
+                    await Task.Delay(1200);
+                    break;
+                }
+
+                var choiceMap = consumers.ToDictionary(
+                    p => $"#{p.Id}  {p.Label}  ({p.Role})  [{(p.IsPaused ? "PAUSED" : "Running")}]"
+                       + (p.SlowMs > 0 ? $"  slow={p.SlowMs}ms" : ""),
+                    p => p);
+
+                var choice = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title("[bold]Pause/Resume — select consumer:[/]")
+                        .AddChoices(choiceMap.Keys));
+
+                _pm.PauseToggle(choiceMap[choice].Id);
                 break;
             }
         }
@@ -292,7 +347,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             BuildLogPanel(),
             new Markup(
                 "\n[grey][[C]][/] Consumer  [grey][[S]][/] SlowConsumer  [grey][[P]][/] Publisher  [grey][[G]][/] GroupOrder" +
-                "    [grey][[K]][/] Graceful stop  [grey][[X]][/] Crash kill  [grey][[Q]][/] Quit\n"),
+                "    [grey][[K]][/] Graceful stop  [grey][[X]][/] Crash kill  [grey][[Z]][/] Pause/Resume  [grey][[Q]][/] Quit\n"),
         };
 
         return new Rows(rows);
@@ -324,7 +379,9 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
         {
             var uptime  = DateTime.Now - p.StartedAt;
             var running = p.IsRunning;
-            var status  = running ? "[green]\u25cf Running[/]" : "[red]\u2717 Exited[/]";
+            var status  = running
+                ? (p.IsPaused ? "[yellow]\u23f8 Paused[/]" : "[green]\u25cf Running[/]")
+                : "[red]\u2717 Exited[/]";
             var slow    = p.SlowMs   > 0 ? $"[yellow]{p.SlowMs}ms[/]" : "[grey]-[/]";
             var rate    = p.Role == WorkerRole.Publisher ? $"{p.RateSeconds}s" : "[grey]-[/]";
             var uptimeS = running
@@ -405,10 +462,27 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             .AddColumn(new TableColumn("[grey]Fries[/]").RightAligned())
             .AddColumn(new TableColumn("[grey]Soda[/]").RightAligned())
             .AddColumn(new TableColumn("[grey]Total[/]").RightAligned())
+            .AddColumn(new TableColumn("[grey]Queued[/]").RightAligned())
             .Expand();
 
-        table.AddRow("[green]Published[/]",
-            pub.Burger.ToString(), pub.Fries.ToString(), pub.Soda.ToString(), pub.Total.ToString());
+        // Look up MessagesReady for a given role's queue from the RabbitMQ API data.
+        string queuedMarkup(WorkerRole r)
+        {
+            var q = _rmq.Latest.FirstOrDefault(q => q.Name.Equals(r.ToString(), StringComparison.OrdinalIgnoreCase));
+            if (q is null) return "[grey]-[/]";
+            return q.MessagesReady switch
+            {
+                > 50 => $"[red]{q.MessagesReady}[/]",
+                > 10 => $"[yellow]{q.MessagesReady}[/]",
+                > 0  => $"[white]{q.MessagesReady}[/]",
+                _    => $"[grey]{q.MessagesReady}[/]",
+            };
+        }
+
+        table.AddRow(new Markup("[green]Published[/]"),
+            new Markup(pub.Burger.ToString()), new Markup(pub.Fries.ToString()),
+            new Markup(pub.Soda.ToString()), new Markup(pub.Total.ToString()),
+            new Markup("[grey]-[/]"));
 
         table.AddEmptyRow();
 
@@ -438,11 +512,12 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
                 new Markup($"[grey]{cons.Burger}[/]  {inQ(pub.Burger, cons.Burger)}"),
                 new Markup($"[grey]{cons.Fries}[/]  {inQ(pub.Fries, cons.Fries)}"),
                 new Markup($"[grey]{cons.Soda}[/]  {inQ(pub.Soda, cons.Soda)}"),
-                new Markup($"{cons.Total}"));
+                new Markup($"{cons.Total}"),
+                new Markup(queuedMarkup(role)));
         }
 
         if (_pm.ConsumedByRole.IsEmpty)
-            table.AddRow("[grey italic](no consumers yet)[/]", "", "", "", "");
+            table.AddRow("[grey italic](no consumers yet)[/]", "", "", "", "", "");
 
         return table;
     }

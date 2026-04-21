@@ -180,6 +180,31 @@ internal sealed class ProcessManager
         ForceKill(target);
     }
 
+    /// <summary>
+    /// Toggles pause/resume on a consumer process by writing the corresponding
+    /// command line to its stdin pipe.  The worker's <c>StdinShutdownMonitor</c>
+    /// reads these lines and calls <c>PauseSignal.Pause()</c> / <c>Resume()</c>,
+    /// which blocks/unblocks each consumer's <c>Consume()</c> before it starts
+    /// processing the next message.
+    /// </summary>
+    public void PauseToggle(int id)
+    {
+        var target = Find(id);
+        if (target is null || !target.IsRunning) return;
+
+        var command = target.IsPaused ? "resume" : "pause";
+        target.IsPaused = !target.IsPaused;
+
+        try
+        {
+            target.SystemProcess.StandardInput.WriteLine(command);
+            target.SystemProcess.StandardInput.Flush();
+            AppendEvent(target.Label, target.Role,
+                target.IsPaused ? "── PAUSED ──" : "── RESUMED ──");
+        }
+        catch { /* process may have already exited */ }
+    }
+
     /// <summary>Hard-kills every tracked process (called on dashboard exit).</summary>
     public void KillAll()
     {

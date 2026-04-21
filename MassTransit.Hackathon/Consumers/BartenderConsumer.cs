@@ -11,15 +11,20 @@ public class BartenderConsumer : IConsumer<IOrderMessage>
 {
     private readonly ILogger<BartenderConsumer> _logger;
     private readonly WorkerOptions _options;
+    private readonly PauseSignal _pauseSignal;
 
-    public BartenderConsumer(ILogger<BartenderConsumer> logger, WorkerOptions options)
+    public BartenderConsumer(ILogger<BartenderConsumer> logger, WorkerOptions options, PauseSignal pauseSignal)
     {
-        _logger = logger;
-        _options = options;
+        _logger      = logger;
+        _options     = options;
+        _pauseSignal = pauseSignal;
     }
 
     public async Task Consume(ConsumeContext<IOrderMessage> context)
     {
+        // Block here while the process is paused; unblocks on resume or cancellation.
+        await _pauseSignal.WaitIfPausedAsync(context.CancellationToken);
+
         if (context.Message.Item != OrderItem.Soda)
             return;
 

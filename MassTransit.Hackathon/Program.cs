@@ -35,6 +35,7 @@ await Host.CreateDefaultBuilder(args)
     .ConfigureServices(services =>
     {
         services.AddSingleton(options);
+        services.AddSingleton<PauseSignal>();
 
         services.AddMassTransit(x =>
         {
