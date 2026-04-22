@@ -1,43 +1,48 @@
-# MassTransit 102 — Advanced Concepts
+﻿# MassTransit 102 — Resilience & Throughput
 
-> Level up from the basics. This guide covers **retries**, **circuit breakers**, **sagas**, **the transactional outbox**, and **testing harnesses** — all through the lens of our kitchen hackathon. Each section maps to achievements in [ACHIEVEMENTS.md](ACHIEVEMENTS.md) so you know exactly where to apply what you learn.
+> When things go wrong — and they will — you need your kitchen to keep serving. This guide covers the **Tier 2 & 3** resilience and throughput tools: retry policies, the error queue, circuit breakers, concurrency control, and batch consumers.
 
 ---
 
 ## Table of Contents
 
-1. [Retry Policies](#1-retry-policies)
-2. [Circuit Breakers](#2-circuit-breakers)
-3. [Sagas & State Machines](#3-sagas--state-machines)
-4. [Transactional Outbox](#4-transactional-outbox)
-5. [Testing with the Test Harness](#5-testing-with-the-test-harness)
-6. [Putting It All Together](#6-putting-it-all-together)
+1. [Immediate Retry](#1-immediate-retry)
+2. [The Error Queue & Moving Messages](#2-the-error-queue--moving-messages)
+3. [Delayed Retry](#3-delayed-retry)
+4. [Circuit Breaker](#4-circuit-breaker)
+5. [Concurrency Limit](#5-concurrency-limit)
+6. [Batch Consumer](#6-batch-consumer)
 
 ---
 
-## 1. Retry Policies
+## 1. Immediate Retry
 
-> 🏆 **Achievements:** *#5 The Hiccup* · *#8 Take a Breather* (Tier 2 — Resilience)
+> 🏆 **Achievement:** *#5 A Minor Slip* (Tier 2 — Kitchen Disasters)
 
 ### Why?
 
-In a real kitchen, the bartender might drop a glass — you don't shut down the bar. You try again. In messaging, transient failures (database timeouts, network blips, resource locks) are normal. Retry policies let MassTransit **automatically re-attempt** a failed `Consume()` call before giving up.
+In a real kitchen, the bartender might drop a glass — you don't shut down the bar. You try again. Transient failures (database timeouts, network blips, optimistic lock conflicts) are normal in distributed systems. **Immediate retry** lets MassTransit automatically re-attempt a failed `Consume()` call before giving up.
 
-### Retry Types at a Glance
+### How It Works
 
-| Policy | Behavior | Best for |
-|--------|----------|----------|
-| **Immediate** | Retry N times with no delay | Quick transient errors (optimistic lock, brief network hiccup) |
-| **Interval** | Retry N times, fixed delay between each | Known recovery time (e.g. wait 2 s for a connection to reset) |
-| **Incremental** | Retry N times, delay increases linearly | Gradually back off without waiting too long |
-| **Exponential** | Retry N times, delay doubles each time | External service rate-limiting or unknown recovery time |
+```
+Message arrives
+  └─► Consumer.Consume()  ❌ throws
+  └─► Consumer.Consume()  ❌ throws  (retry 1)
+  └─► Consumer.Consume()  ❌ throws  (retry 2)
+  └─► Consumer.Consume()  ✅ succeeds (retry 3)
+```
 
-### Kitchen Example — Immediate Retry
+Retries happen **in-process** — RabbitMQ doesn't see them. The message stays in memory and is re-delivered to the consumer directly.
 
-The line cook's grill occasionally flames out. We give it 3 quick retries before sending the order to the error queue.
+**One-liner:** `Immediate(3)` means "try up to 4 times total (1 original + 3 retries) with no delay between them."
+
+### Kitchen Example
+
+The line cook's grill occasionally flames out. Three quick retries before the order hits the bin.
 
 ```csharp
-// In Program.cs — configure the LineCookConsumer endpoint
+// Program.cs
 x.UsingRabbitMq((context, cfg) =>
 {
     cfg.Host("localhost", "/", h =>
@@ -48,7 +53,7 @@ x.UsingRabbitMq((context, cfg) =>
 
     cfg.ReceiveEndpoint("line-cook-consumer", e =>
     {
-        // 🔁 Retry up to 3 times immediately
+        // 🔁 Retry up to 3 times immediately (no delay)
         e.UseMessageRetry(r => r.Immediate(3));
 
         e.ConfigureConsumer<LineCookConsumer>(context);
@@ -58,15 +63,12 @@ x.UsingRabbitMq((context, cfg) =>
 });
 ```
 
-To **see it in action**, add a random failure inside `LineCookConsumer.Consume()`:
+To **see it in action**, add a random failure to `LineCookConsumer.Consume()`:
 
 ```csharp
 public async Task Consume(ConsumeContext<IOrderMessage> context)
 {
-    if (context.Message.Item == OrderItem.Soda)
-        return;
-
-    // 🔥 Simulate a grill flare-up (50% chance)
+    // 🔥 50% chance the grill flames out
     if (Random.Shared.Next(2) == 0)
         throw new Exception("Grill flamed out! Retrying...");
 
@@ -75,44 +77,144 @@ public async Task Consume(ConsumeContext<IOrderMessage> context)
 }
 ```
 
-Watch the console — you'll see the same `OrderId` retried up to 3 times before it succeeds or lands in the `_error` queue.
+Watch the console — you'll see the same `OrderId` logged in retries before it finally succeeds or exhausts all attempts.
 
-### Kitchen Example — Delayed Retry
+### Filtering Exceptions
 
-The bartender ran out of ice and needs to wait for the ice machine. Use a delayed/interval retry to pause between attempts.
+Retry only specific exception types to avoid retrying bad input:
+
+```csharp
+e.UseMessageRetry(r => r.Immediate(3)
+    .Handle<TimeoutException>()    // only retry timeouts
+    .Ignore<ArgumentException>()   // never retry bad input
+);
+```
+
+### Key Points
+
+- `Immediate(3)` = 3 retries. Total attempts = 4.
+- Retries are **in-process** — no RabbitMQ round-trip, no message re-queuing.
+- When all retries are exhausted, the message moves to the **`_error` queue** (see §2).
+- Place `UseMessageRetry` **before** any other middleware on the endpoint.
+
+---
+
+## 2. The Error Queue & Moving Messages
+
+> 🏆 **Achievements:** *#6 Spoiled Goods* · *#7 Rescuing the Dish* (Tier 2 — Kitchen Disasters)
+
+### The `_error` Queue
+
+When a message exhausts all retries (or throws with no retry policy), MassTransit **moves it to an error queue**: `<queue-name>_error`.
+
+```
+line-cook-consumer  →  all retries failed  →  line-cook-consumer_error
+```
+
+The error queue is automatically created by MassTransit. Messages here include the **original payload plus fault metadata** (exception type, message, stack trace).
+
+**Kitchen analogy:** The spoiled ingredients go to the waste bin — clearly labeled with what went wrong and when.
+
+### Finding It in the RabbitMQ UI
+
+1. Open [http://localhost:15672](http://localhost:15672) → **Queues** tab.
+2. Look for `line-cook-consumer_error` (or `bartender-consumer_error`, etc.).
+3. Click on it → **Get messages** → set Count to 1 → click **Get Message(s)**.
+4. You'll see the full JSON payload and headers including `x-first-death-reason` with the exception details.
+
+> 💡 Messages in `_error` are **safe** — they won't be consumed again until you take action. Use this as your audit log for failures.
+
+### Moving Messages Back (Manual Rescue)
+
+To re-process a message from the error queue:
+
+**Option 1 — RabbitMQ UI (one message at a time):**
+
+1. Queue → **Get messages** → copy the raw payload.
+2. Go to the **Exchanges** tab → find the target exchange (e.g. `line-cook-consumer`).
+3. **Publish message** → paste the payload → click **Publish**.
+
+**Option 2 — RabbitMQ UI "Move messages" plugin (if enabled):**
+
+1. Go to the `_error` queue → click **Move messages**.
+2. Enter the destination queue name → **Move**.
+
+> 💡 The Shovel or Shovel Management plugin can automate this for production. For the hackathon, the manual UI approach is fine.
+
+### Key Points
+
+- Every consumer gets its own `_error` queue: `<consumer-name>_error`.
+- Error queues are created automatically — you don't configure them.
+- Messages in `_error` include fault metadata headers (`x-exception-type`, `x-exception-message`).
+- Moving a message back re-queues it for a fresh delivery — retries start over.
+
+---
+
+## 3. Delayed Retry
+
+> 🏆 **Achievement:** *#8 Rest the Dough* (Tier 2 — Kitchen Disasters)
+
+### Why?
+
+Immediate retries make sense for a brief flare-up. But if the bartender ran out of ice, retrying instantly 3 times won't help — the ice machine needs time to cycle. A **delayed retry** inserts a pause between attempts, giving the system time to recover.
+
+### Retry Types at a Glance
+
+| Policy | Behavior | Best for |
+|--------|----------|----------|
+| **Immediate** | N retries, no delay | Quick transient errors (optimistic lock, brief network hiccup) |
+| **Interval** | N retries, fixed delay between each | Known recovery time (e.g. wait 2 s for a connection reset) |
+| **Incremental** | N retries, delay increases by a fixed step | Gradual back-off with a predictable cap |
+| **Exponential** | N retries, delay doubles each time | External service rate-limiting or unknown recovery time |
+
+### Kitchen Example
+
+The bartender is out of ice. Wait 2 seconds between each of 3 attempts.
 
 ```csharp
 cfg.ReceiveEndpoint("bartender-consumer", e =>
 {
-    // ⏳ Retry 3 times, waiting 2 seconds between each attempt
+    // ⏳ 3 retries, 2-second pause between each
     e.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(2)));
 
     e.ConfigureConsumer<BartenderConsumer>(context);
 });
 ```
 
-### Key Points
-
-- Retries happen **in-process** — the message stays in memory; RabbitMQ doesn't see intermediate failures.
-- When all retries are exhausted, the message moves to the `_error` queue (Achievement **#6 Toxic Waste**).
-- You can combine retry with **exception filters** to retry only specific exception types:
+For a gradually increasing wait (Incremental):
 
 ```csharp
-e.UseMessageRetry(r => r.Immediate(3)
-    .Handle<TimeoutException>()   // only retry timeouts
-    .Ignore<ArgumentException>()  // never retry bad input
-);
+// 1st retry after 1s, 2nd after 2s, 3rd after 3s
+e.UseMessageRetry(r => r.Incremental(3,
+    initialInterval: TimeSpan.FromSeconds(1),
+    intervalIncrement: TimeSpan.FromSeconds(1)));
 ```
+
+For exponential back-off (doubles each time):
+
+```csharp
+// 1st retry after 1s, 2nd after 2s, 3rd after 4s
+e.UseMessageRetry(r => r.Exponential(3,
+    minInterval: TimeSpan.FromSeconds(1),
+    maxInterval: TimeSpan.FromMinutes(1),
+    intervalDelta: TimeSpan.FromSeconds(1)));
+```
+
+### Key Points
+
+- All retry types are **in-process** — the message stays in memory during the wait.
+- Delayed retries still exhaust to the `_error` queue on final failure.
+- For very long delays (minutes to hours), use **`UseScheduledRedelivery`** instead — it re-queues via the broker rather than holding in memory.
 
 ---
 
-## 2. Circuit Breakers
+## 4. Circuit Breaker
 
-> 🏆 **Achievement:** *#9 Tripping the Breaker* (Tier 2 — Resilience)
+> 🏆 **Achievement:** *#9 The Kitchen Fire* (Tier 2 — Kitchen Disasters)
 
 ### Why?
 
-If the grill is completely broken, there's no point sending every burger order into a 3-retry loop that always fails. A **circuit breaker** detects sustained failures and **short-circuits** — instantly rejecting new messages for a cooldown period. This protects downstream systems and lets the kitchen recover.
+If the grill is completely broken, there's no point routing every burger order into a 3-retry loop that always fails. A **circuit breaker** detects sustained failure and **short-circuits** — instantly moving new messages to the error queue for a cooldown period. This protects downstream systems and lets the kitchen recover.
 
 ### How It Works
 
@@ -122,592 +224,207 @@ If the grill is completely broken, there's no point sending every burger order i
  │ (normal) │  hit limit   │ (reject) │  timer done   │  (probe)  │
  └─────────┘               └──────────┘               └───────────┘
       ▲                                                     │
-      │              success on probe message                │
+      │              success on probe message               │
       └─────────────────────────────────────────────────────┘
 ```
 
 | State | What happens |
 |-------|-------------|
 | **Closed** | Messages flow normally. Failures are counted. |
-| **Open** | All messages are **immediately** moved to `_error`. No processing attempted. |
-| **Half-Open** | One message is allowed through as a test. If it succeeds → back to Closed. If it fails → back to Open. |
+| **Open** | All messages are **immediately** moved to `_error`. No consumer code runs. |
+| **Half-Open** | One message is allowed through as a test. Success → back to Closed. Failure → back to Open. |
 
 ### Kitchen Example
 
-The line cook's grill is toast. After 5 failures in 30 seconds, stop trying and let the grill cool down for a minute.
+The grill is toast. After 5% of messages fail within 30 seconds (minimum 5 messages), stop sending orders and let it cool down for 1 minute.
 
 ```csharp
 cfg.ReceiveEndpoint("line-cook-consumer", e =>
 {
-    // 🔁 Inner retry: try 3 times per message
+    // 🔁 Inner: retry each message up to 3 times first
     e.UseMessageRetry(r => r.Immediate(3));
 
-    // 🔌 Outer circuit breaker: if 5 messages fail within 30 s,
-    //    open the circuit for 1 minute
+    // 🔌 Outer: if failure threshold is hit within 30 s, open the circuit for 1 minute
     e.UseCircuitBreaker(cb =>
     {
-        cb.TrackingPeriod = TimeSpan.FromSeconds(30);
-        cb.TripThreshold = 5;
-        cb.ActiveThreshold = 5;
-        cb.ResetInterval = TimeSpan.FromMinutes(1);
+        cb.TrackingPeriod = TimeSpan.FromSeconds(30);  // sliding window
+        cb.TripThreshold  = 5;   // failure rate % to trip
+        cb.ActiveThreshold = 5;  // minimum messages before tripping can happen
+        cb.ResetInterval  = TimeSpan.FromMinutes(1);   // how long to stay Open
     });
 
     e.ConfigureConsumer<LineCookConsumer>(context);
 });
 ```
 
-### Testing It (Achievement #9)
-
-1. Hardcode `LineCookConsumer` to always throw.
-2. Publish 6+ burger orders quickly.
-3. The first 5 fail after retries (Closed → Open).
-4. The 6th message **instantly** fails — no retries, no consumer code runs.
-5. Check the RabbitMQ UI: messages piling in `line-cook-consumer_error`.
-6. Wait 1 minute → the breaker moves to Half-Open → next message is probed.
+> 💡 `TripThreshold` is a **percentage** (5 = 5%). `ActiveThreshold` is the minimum number of messages that must have been processed in the tracking window before the circuit can trip — this prevents tripping on the very first failure.
 
 ### Retry + Circuit Breaker Ordering
 
-The **order of middleware matters**. Think of it as wrapping layers:
+The **order of middleware matters**. Think of wrapping layers — outermost runs first:
 
 ```
 Message arrives
-  └─► Circuit Breaker (outer) — rejects if open
-        └─► Retry (inner) — retries on failure
+  └─► Circuit Breaker (outer) — short-circuits if open
+        └─► Retry (inner) — retries before counting as a failure
               └─► Consumer.Consume() — your code
 ```
 
-Always configure retry **before** the circuit breaker in the pipeline (i.e. retry is the inner layer).
+Always register retry **before** the circuit breaker in the pipeline (retry is registered first = it is the inner layer).
+
+### Testing It (Achievement #9)
+
+1. Hardcode `LineCookConsumer` to always `throw`.
+2. Publish 6+ burger orders quickly.
+3. First 5 fail after retries → circuit opens.
+4. 6th message **instantly** lands in `_error` — no consumer code, no retries.
+5. Check RabbitMQ UI: `line-cook-consumer_error` fills up instantly for message 6+.
+6. Wait 1 minute → circuit moves to Half-Open → next message is probed.
 
 ---
 
-## 3. Sagas & State Machines
+## 5. Concurrency Limit
 
-> 🏆 **Achievements:** *#14 The State Master* · *#15 Connecting the Dots* · *#16 The Ticking Clock* (Tier 4 — Sagas & Coordination)
+> 🏆 **Achievement:** *#12 The Head Chef* (Tier 3 — Rush Hour)
 
 ### Why?
 
-A single kitchen order is simple. But a **multi-course meal** has stages: appetizer → entrée → dessert. If the dessert takes too long, you might cancel it. **Sagas** (specifically MassTransit's *Automatonymous* state machines) let you model this kind of **long-running, multi-step workflow** as an explicit state machine.
+By default, MassTransit processes messages **concurrently** — as fast as the broker delivers them. For some consumers, that's dangerous: a consumer that hits a shared database or a rate-limited API will thrash if 20 messages arrive at once. `UseConcurrencyLimit` caps how many messages a consumer processes at the same time.
 
-### Core Concepts
+**Kitchen analogy:** The head chef only has two hands. No matter how many tickets come in, they personally touch at most 2 dishes at once.
 
-| Concept | Kitchen Analogy |
-|---------|-----------------|
-| **State** | Where is this order right now? (`Submitted`, `Cooking`, `Ready`, `Cancelled`) |
-| **Event** | Something that happened (`OrderSubmitted`, `ItemCooked`, `TimedOut`) |
-| **Saga Instance** | One specific order being tracked (identified by `CorrelationId`) |
-| **CorrelationId** | The order number — ties all events to the same order |
+### How It Works
 
-### Step-by-Step: Building a Kitchen Order Saga
-
-#### 1. Define the Events (Messages)
-
-```csharp
-// Messages/IOrderSubmitted.cs
-public interface IOrderSubmitted
-{
-    Guid CorrelationId { get; }   // 🔑 ties everything together
-    OrderItem Item { get; }
-    DateTime SubmittedAt { get; }
-}
-
-// Messages/IOrderCooked.cs
-public interface IOrderCooked
-{
-    Guid CorrelationId { get; }
-    DateTime CookedAt { get; }
-}
+```
+Queue: 10 messages waiting
+  └─► ConcurrencyLimit(2)
+        ├─► Consumer.Consume() [msg 1]  ← processing
+        ├─► Consumer.Consume() [msg 2]  ← processing
+        └─► msg 3..10 wait in queue     ← held back by prefetch
 ```
 
-#### 2. Define the Saga Instance (State Storage)
+### Kitchen Example
 
 ```csharp
-// Sagas/KitchenOrderState.cs
-using MassTransit;
-
-public class KitchenOrderState : SagaStateMachineInstance
+cfg.ReceiveEndpoint("line-cook-consumer", e =>
 {
-    public Guid CorrelationId { get; set; }  // primary key
-    public string CurrentState { get; set; } = default!;
-    public OrderItem Item { get; set; }
-    public DateTime? SubmittedAt { get; set; }
-    public DateTime? CookedAt { get; set; }
-}
-```
+    // 👨‍🍳 Only 2 dishes on the pass at once
+    e.UseConcurrencyLimit(2);
 
-#### 3. Define the State Machine
-
-```csharp
-// Sagas/KitchenOrderStateMachine.cs
-using MassTransit;
-
-public class KitchenOrderStateMachine : MassTransitStateMachine<KitchenOrderState>
-{
-    // States
-    public State Submitted { get; private set; } = default!;
-    public State Cooking { get; private set; } = default!;
-    public State Ready { get; private set; } = default!;
-    public State Cancelled { get; private set; } = default!;
-
-    // Events
-    public Event<IOrderSubmitted> OrderSubmitted { get; private set; } = default!;
-    public Event<IOrderCooked> OrderCooked { get; private set; } = default!;
-
-    // Timeout schedule
-    public Schedule<KitchenOrderState, OrderTimedOut> OrderTimeout { get; private set; } = default!;
-
-    public KitchenOrderStateMachine()
-    {
-        // Tell MassTransit which property holds the current state
-        InstanceState(x => x.CurrentState);
-
-        // Map events to CorrelationId
-        Event(() => OrderSubmitted, x => x.CorrelateById(ctx => ctx.Message.CorrelationId));
-        Event(() => OrderCooked,    x => x.CorrelateById(ctx => ctx.Message.CorrelationId));
-
-        // ⏱ Schedule a timeout (Achievement #16)
-        Schedule(() => OrderTimeout, x => x.CorrelationId, s =>
-        {
-            s.Delay = TimeSpan.FromSeconds(30);
-            s.Received = r => r.CorrelateById(ctx => ctx.Message.CorrelationId);
-        });
-
-        // 🗺 State transitions
-        Initially(
-            When(OrderSubmitted)
-                .Then(ctx =>
-                {
-                    ctx.Saga.Item = ctx.Message.Item;
-                    ctx.Saga.SubmittedAt = ctx.Message.SubmittedAt;
-                })
-                .Schedule(OrderTimeout, ctx => new OrderTimedOut
-                {
-                    CorrelationId = ctx.Saga.CorrelationId
-                })
-                .TransitionTo(Submitted)
-        );
-
-        During(Submitted,
-            When(OrderCooked)
-                .Then(ctx => ctx.Saga.CookedAt = ctx.Message.CookedAt)
-                .Unschedule(OrderTimeout)
-                .TransitionTo(Ready)
-                .Finalize(),
-
-            When(OrderTimeout!.Received)
-                .TransitionTo(Cancelled)
-                .Finalize()
-        );
-
-        // Clean up completed sagas
-        SetCompletedWhenFinalized();
-    }
-}
-
-// Timeout message
-public class OrderTimedOut
-{
-    public Guid CorrelationId { get; set; }
-}
-```
-
-#### 4. Register in Program.cs
-
-```csharp
-services.AddMassTransit(x =>
-{
-    // Register the saga with in-memory storage (great for hackathon!)
-    x.AddSagaStateMachine<KitchenOrderStateMachine, KitchenOrderState>()
-     .InMemoryRepository();
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host("localhost", "/", h =>
-        {
-            h.Username("guest");
-            h.Password("guest");
-        });
-
-        // Enable the message scheduler for timeouts
-        cfg.UseInMemoryScheduler();
-
-        cfg.ConfigureEndpoints(context);
-    });
+    e.ConfigureConsumer<LineCookConsumer>(context);
 });
 ```
 
-### How It Flows
+### Observing It (Achievement #12)
 
-```
-[Waiter]                  [Saga]                  [LineCook]
-   │                        │                         │
-   │  Publish               │                         │
-   │  IOrderSubmitted ────► │ Initial → Submitted     │
-   │                        │ (start 30s timer)       │
-   │                        │                         │
-   │                        │     IOrderCooked ◄───── │
-   │                        │ Submitted → Ready       │
-   │                        │ (cancel timer, done!)   │
-   │                        │                         │
-   ─── OR if 30s pass ──── │                         │
-   │                        │ Submitted → Cancelled   │
-   │                        │ (timeout fired!)        │
-```
+1. Add `await Task.Delay(2000)` inside `LineCookConsumer.Consume()` to simulate slow work.
+2. Publish 10 messages.
+3. Open the RabbitMQ UI → `line-cook-consumer` queue → watch **Unacked**.
+4. It should stay at or below 2 — the rest sit in **Ready**.
+
+> 💡 `UseConcurrencyLimit` works by controlling the **prefetch count** on the channel and using an internal semaphore. The broker delivers only as many messages as the consumer is ready to handle.
 
 ### Key Points
 
-- Each saga instance is identified by a **`CorrelationId`** (Guid). All events for the same order share this Id.
-- **In-memory repository** is fine for hackathon/dev. For production, use **Entity Framework**, **Redis**, or **MongoDB**.
-- **`SetCompletedWhenFinalized()`** removes the saga instance once it reaches a `Final` state.
+- `UseConcurrencyLimit(1)` = sequential processing (no parallelism). Useful for ordered or idempotent-sensitive work.
+- Can be combined with multiple consumer instances: 3 instances × `UseConcurrencyLimit(2)` = 6 concurrent max.
+- Must be placed in the `ReceiveEndpoint` configuration, not at the bus level.
 
 ---
 
-## 4. Transactional Outbox
+## 6. Batch Consumer
 
-> 🏆 **Achievement:** *#20 The Outbox (Boss)* (Tier 5 — Observability & Production Readiness)
-
-### The Problem
-
-Imagine the manager writes an order to the database **and** publishes a message. What if the database save succeeds but RabbitMQ is down? The message is lost. What if the publish succeeds but the database crashes? The data is inconsistent.
-
-```csharp
-// ⚠️ DANGEROUS — not atomic
-await _dbContext.Orders.AddAsync(order);
-await _dbContext.SaveChangesAsync();           // ✅ saved
-await _publishEndpoint.Publish<IOrderCooked>(  // ❌ what if this fails?
-    new { order.CorrelationId, CookedAt = DateTime.UtcNow });
-```
-
-### The Solution: Transactional Outbox
-
-The outbox pattern ensures **database writes and message publishes are atomic**:
-
-1. Instead of publishing to RabbitMQ directly, MassTransit writes the message to an **outbox table** in the same database transaction.
-2. A background process reads the outbox table and delivers messages to RabbitMQ.
-3. If the database save fails → the outbox row is also rolled back → no orphan message.
-4. If RabbitMQ is down → the outbox row survives → message is delivered once the broker is back.
-
-```
-┌───────────────────────────────────────────┐
-│  Single Database Transaction              │
-│                                           │
-│  1. INSERT INTO Orders (...)              │
-│  2. INSERT INTO OutboxMessages (...)      │ ← MassTransit does this
-│  COMMIT                                   │
-└───────────────────────────────────────────┘
-        │
-        ▼ (background thread)
-┌──────────────────┐     ┌──────────────────┐
-│  OutboxMessages   │ ──► │    RabbitMQ       │
-│  table            │     │                  │
-└──────────────────┘     └──────────────────┘
-```
-
-### Kitchen Example with EF Core
-
-#### 1. Install NuGet Packages
-
-```bash
-dotnet add package MassTransit.EntityFrameworkCore
-dotnet add package Microsoft.EntityFrameworkCore.Sqlite   # or your provider
-```
-
-#### 2. Create a DbContext with Outbox Support
-
-```csharp
-using MassTransit;
-using Microsoft.EntityFrameworkCore;
-
-public class KitchenDbContext : DbContext
-{
-    public KitchenDbContext(DbContextOptions<KitchenDbContext> options)
-        : base(options) { }
-
-    public DbSet<KitchenOrder> Orders => Set<KitchenOrder>();
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
-        // Add MassTransit outbox tables (InboxState, OutboxMessage, OutboxState)
-        modelBuilder.AddInboxStateEntity();
-        modelBuilder.AddOutboxMessageEntity();
-        modelBuilder.AddOutboxStateEntity();
-    }
-}
-
-public class KitchenOrder
-{
-    public Guid Id { get; set; }
-    public string Item { get; set; } = default!;
-    public DateTime CreatedAt { get; set; }
-}
-```
-
-#### 3. Wire It Up in Program.cs
-
-```csharp
-services.AddDbContext<KitchenDbContext>(opt =>
-    opt.UseSqlite("Data Source=kitchen.db"));
-
-services.AddMassTransit(x =>
-{
-    x.AddEntityFrameworkOutbox<KitchenDbContext>(o =>
-    {
-        o.UseSqlite();            // match your EF provider
-        o.UseBusOutbox();         // delivers messages via a background service
-    });
-
-    x.AddConsumer<LineCookConsumer>();
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host("localhost", "/", h =>
-        {
-            h.Username("guest");
-            h.Password("guest");
-        });
-
-        cfg.ConfigureEndpoints(context);
-    });
-});
-```
-
-#### 4. Use It in a Consumer
-
-```csharp
-public class LineCookConsumer : IConsumer<IOrderSubmitted>
-{
-    private readonly KitchenDbContext _db;
-
-    public LineCookConsumer(KitchenDbContext db) => _db = db;
-
-    public async Task Consume(ConsumeContext<IOrderSubmitted> context)
-    {
-        // Save to DB and publish — in the SAME transaction
-        _db.Orders.Add(new KitchenOrder
-        {
-            Id = context.Message.CorrelationId,
-            Item = context.Message.Item.ToString(),
-            CreatedAt = DateTime.UtcNow
-        });
-
-        // This publish is captured by the outbox, not sent to RabbitMQ yet
-        await context.Publish<IOrderCooked>(new
-        {
-            context.Message.CorrelationId,
-            CookedAt = DateTime.UtcNow
-        });
-
-        // Both the DB row and the outbox message commit together
-        await _db.SaveChangesAsync();
-    }
-}
-```
-
-### Key Points
-
-- The outbox guarantees **exactly-once message delivery** (combined with the inbox for deduplication).
-- `UseBusOutbox()` adds a background service that polls the outbox table and delivers messages to RabbitMQ.
-- For the hackathon, SQLite keeps it simple. Production systems use SQL Server, PostgreSQL, etc.
-
----
-
-## 5. Testing with the Test Harness
-
-> 🏆 **Achievement:** *#19 Safe in the Sandbox* (Tier 5 — Observability & Production Readiness)
+> 🏆 **Achievement:** *#13 Batch Order* (Tier 3 — Rush Hour)
 
 ### Why?
 
-You shouldn't need Docker or RabbitMQ running to verify your consumer logic. MassTransit's **Test Harness** spins up an **in-memory bus** that behaves like the real thing — you publish messages, assert they were consumed, and check side effects.
+Processing messages one by one is fine for most cases. But some operations are much more efficient in bulk: a single `INSERT ... VALUES (...)` for 10 rows is faster than 10 individual inserts. A **batch consumer** accumulates messages and processes them as a group.
 
-### Setup
+**Kitchen analogy:** The line cook waits at the pass until there are 10 tickets, or until 5 seconds have passed — whichever comes first. Then they call "fire" on all of them at once.
 
-Add the testing packages to a test project:
+### How It Works
 
-```bash
-dotnet add package MassTransit.Testing
-dotnet add package Microsoft.Extensions.DependencyInjection
-dotnet add package xunit          # or NUnit / MSTest — your choice
+```
+Messages arrive one by one
+  └─► Batch buffer
+        ├─► 10 messages collected?  → fire batch immediately
+        └─► 5 seconds elapsed?      → fire whatever is buffered
 ```
 
-### Kitchen Example — Testing the LineCookConsumer
+### Implementing the Batch Consumer
 
 ```csharp
+// Consumers/BatchLineCookConsumer.cs
 using MassTransit;
-using MassTransit.Testing;
-using MassTransit.Hackathon.Consumers;
-using MassTransit.Hackathon.Messages;
-using Microsoft.Extensions.DependencyInjection;
-using Xunit;
 
-public class LineCookConsumerTests
+public class BatchLineCookConsumer : IConsumer<Batch<IOrderMessage>>
 {
-    [Fact]
-    public async Task Should_consume_burger_order()
+    private readonly ILogger<BatchLineCookConsumer> _logger;
+
+    public BatchLineCookConsumer(ILogger<BatchLineCookConsumer> logger) => _logger = logger;
+
+    public Task Consume(ConsumeContext<Batch<IOrderMessage>> context)
     {
-        // Arrange — build a test harness with the consumer
-        await using var provider = new ServiceCollection()
-            .AddSingleton(new WorkerOptions()) // default options
-            .AddMassTransitTestHarness(x =>
-            {
-                x.AddConsumer<LineCookConsumer>();
-            })
-            .BuildServiceProvider(true);
+        _logger.LogInformation("[BatchLineCook] Firing batch of {Count} orders",
+            context.Message.Length);
 
-        var harness = provider.GetRequiredService<ITestHarness>();
-        await harness.Start();
-
-        // Act — publish a burger order
-        await harness.Bus.Publish<IOrderMessage>(new
+        foreach (var msg in context.Message)
         {
-            OrderId = "TEST1",
-            Item = OrderItem.Burger,
-            PlacedAt = DateTime.UtcNow
-        });
+            _logger.LogInformation("  → [{OrderId}] {Item}",
+                msg.Message.OrderId, msg.Message.Item);
+        }
 
-        // Assert — the consumer received and processed the message
-        Assert.True(await harness.Consumed.Any<IOrderMessage>(
-            x => x.Context.Message.OrderId == "TEST1"));
-
-        var consumerHarness = harness.GetConsumerHarness<LineCookConsumer>();
-        Assert.True(await consumerHarness.Consumed.Any<IOrderMessage>(
-            x => x.Context.Message.OrderId == "TEST1"));
-    }
-
-    [Fact]
-    public async Task Should_ignore_soda_order()
-    {
-        await using var provider = new ServiceCollection()
-            .AddSingleton(new WorkerOptions())
-            .AddMassTransitTestHarness(x =>
-            {
-                x.AddConsumer<LineCookConsumer>();
-            })
-            .BuildServiceProvider(true);
-
-        var harness = provider.GetRequiredService<ITestHarness>();
-        await harness.Start();
-
-        // Act — publish a soda order (not the line cook's job)
-        await harness.Bus.Publish<IOrderMessage>(new
-        {
-            OrderId = "SODA1",
-            Item = OrderItem.Soda,
-            PlacedAt = DateTime.UtcNow
-        });
-
-        // Assert — message was consumed (delivered) but the cook did nothing
-        Assert.True(await harness.Consumed.Any<IOrderMessage>());
-
-        // The consumer still technically "consumed" it (returned early),
-        // but you can verify no side effects occurred (no logs, no DB writes, etc.)
+        return Task.CompletedTask;
     }
 }
 ```
 
-### Testing a Saga
+### Registering the Batch Consumer
 
 ```csharp
-[Fact]
-public async Task Should_transition_to_submitted_on_order()
+// Program.cs
+x.AddConsumer<BatchLineCookConsumer>(c =>
 {
-    await using var provider = new ServiceCollection()
-        .AddMassTransitTestHarness(x =>
-        {
-            x.AddSagaStateMachine<KitchenOrderStateMachine, KitchenOrderState>()
-             .InMemoryRepository();
-        })
-        .BuildServiceProvider(true);
+    // 🍽️ Fire when 10 messages OR 5 seconds — whichever comes first
+    c.Options<BatchOptions>(o => o
+        .SetMessageLimit(10)
+        .SetTimeLimit(TimeSpan.FromSeconds(5)));
+});
+```
 
-    var harness = provider.GetRequiredService<ITestHarness>();
-    await harness.Start();
+> 💡 `SetMessageLimit` and `SetTimeLimit` work as **OR** conditions — the batch fires as soon as either threshold is hit.
 
-    var orderId = NewId.NextGuid();
+### What You'll See
 
-    // Act — submit an order
-    await harness.Bus.Publish<IOrderSubmitted>(new
-    {
-        CorrelationId = orderId,
-        Item = OrderItem.Burger,
-        SubmittedAt = DateTime.UtcNow
-    });
+Publish 25 messages quickly, then wait:
 
-    // Assert — saga instance exists and is in the Submitted state
-    var sagaHarness = harness
-        .GetSagaStateMachineHarness<KitchenOrderStateMachine, KitchenOrderState>();
-
-    Assert.True(await sagaHarness.Consumed.Any<IOrderSubmitted>());
-    Assert.True(await sagaHarness.Created.Any(x =>
-        x.CorrelationId == orderId));
-
-    var instance = sagaHarness.Created
-        .ContainsInState(orderId, sagaHarness.StateMachine, sagaHarness.StateMachine.Submitted);
-    Assert.NotNull(instance);
-}
+```
+[BatchLineCook] Firing batch of 10 orders
+  → [id-01] Burger
+  → [id-02] Fries
+  ...
+[BatchLineCook] Firing batch of 10 orders
+  ...
+[BatchLineCook] Firing batch of 5 orders   ← time limit fired, only 5 left
 ```
 
 ### Key Points
 
-- The test harness uses an **in-memory transport** — no RabbitMQ needed.
-- `harness.Consumed.Any<T>()` waits (with a default timeout) for a message to be consumed.
-- `GetConsumerHarness<T>()` lets you assert at the consumer level.
-- `GetSagaStateMachineHarness<T, TInstance>()` lets you inspect saga state transitions.
-- Tests run fast and are fully deterministic.
+- `context.Message` is a `Batch<T>` — iterate it with a `foreach`, access each item via `.Message`.
+- Batches are **all-or-nothing**: if the batch consumer throws, all messages in the batch are faulted.
+- Combine with `UseConcurrencyLimit(1)` to prevent overlapping batch processing.
+- Tune `SetMessageLimit` and `SetTimeLimit` based on your latency vs. throughput trade-off.
 
 ---
 
-## 6. Putting It All Together
-
-Here's how these concepts layer on top of each other in our kitchen:
-
-```
-                              ┌─────────────────────┐
-                              │   Test Harness       │
-                              │  (verify everything  │
-                              │   without Docker)    │
-                              └────────┬────────────┘
-                                       │ tests
-                                       ▼
-┌──────────┐  IOrderSubmitted  ┌──────────────────┐  IOrderCooked   ┌──────────┐
-│  Waiter   │ ───────────────► │  Kitchen Saga     │ ◄────────────── │ LineCook │
-│ Publisher │                  │  (State Machine)  │                 │ Consumer │
-└──────────┘                   │                   │                 └──────────┘
-                               │ Submitted→Ready   │                    │
-                               │ or →Cancelled     │         ┌─────────┴──────────┐
-                               └──────────────────┘         │  Retry (3x immed)  │
-                                                            │  Circuit Breaker   │
-                                                            │  (5 fails → open)  │
-                                                            └─────────┬──────────┘
-                                                                      │
-                                                            ┌─────────▼──────────┐
-                                                            │  Transactional     │
-                                                            │  Outbox (EF Core)  │
-                                                            │  DB + Publish      │
-                                                            │  in one TX         │
-                                                            └────────────────────┘
-```
-
-### Achievement Cheat Sheet
+## Achievement Cheat Sheet
 
 | Achievement | Concept | Section |
 |-------------|---------|---------|
-| **#5** The Hiccup | Immediate Retry | [§1 Retry Policies](#1-retry-policies) |
-| **#8** Take a Breather | Delayed / Interval Retry | [§1 Retry Policies](#1-retry-policies) |
-| **#9** Tripping the Breaker | Circuit Breaker | [§2 Circuit Breakers](#2-circuit-breakers) |
-| **#14** The State Master | Saga State Machine | [§3 Sagas & State Machines](#3-sagas--state-machines) |
-| **#15** Connecting the Dots | Saga Event Correlation | [§3 Sagas & State Machines](#3-sagas--state-machines) |
-| **#16** The Ticking Clock | Saga Timeout / Schedule | [§3 Sagas & State Machines](#3-sagas--state-machines) |
-| **#19** Safe in the Sandbox | Test Harness | [§5 Testing with the Test Harness](#5-testing-with-the-test-harness) |
-| **#20** The Outbox (Boss) | Transactional Outbox | [§4 Transactional Outbox](#4-transactional-outbox) |
-
----
-
-## Further Reading
-
-- [MassTransit Documentation](https://masstransit.io/documentation/concepts)
-- [MassTransit Retry Configuration](https://masstransit.io/documentation/concepts/exceptions)
-- [Automatonymous State Machines](https://masstransit.io/documentation/patterns/saga/state-machine)
-- [Transactional Outbox](https://masstransit.io/documentation/patterns/transactional-outbox)
-- [Testing with MassTransit](https://masstransit.io/documentation/concepts/testing)
-
----
-
-> 🍔 **Happy hacking!** Start with retries (Tier 2), graduate to sagas (Tier 4), and finish with the outbox and tests (Tier 5). Refer back to [ACHIEVEMENTS.md](ACHIEVEMENTS.md) to check off your progress.
+| **#5** A Minor Slip | Immediate Retry | [§1 Immediate Retry](#1-immediate-retry) |
+| **#6** Spoiled Goods | Error Queue | [§2 The Error Queue](#2-the-error-queue--moving-messages) |
+| **#7** Rescuing the Dish | Move from `_error` | [§2 The Error Queue](#2-the-error-queue--moving-messages) |
+| **#8** Rest the Dough | Delayed Retry | [§3 Delayed Retry](#3-delayed-retry) |
+| **#9** The Kitchen Fire | Circuit Breaker | [§4 Circuit Breaker](#4-circuit-breaker) |
+| **#12** The Head Chef | Concurrency Limit | [§5 Concurrency Limit](#5-concurrency-limit) |
+| **#13** Batch Order | Batch Consumer | [§6 Batch Consumer](#6-batch-consumer) |

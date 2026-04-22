@@ -44,20 +44,45 @@ internal sealed class TuiDashboard
     private readonly ProcessManager  _pm;
     private readonly RabbitMqMonitor _rmq;
 
+    private const int LogHistory = 100;
+    private const int LogVisible = 8;
+
     private readonly CancellationTokenSource _sessionCts = new();
     private readonly Queue<LogEntry>          _logLines   = new();
 
     // Written by keyboard thread, read by render loop (volatile for visibility)
     private volatile PendingCommand? _pendingCommand;
 
+    // Log scroll: 0 = newest, higher = older. Adjusted by arrow keys.
+    private volatile int _logScrollOffset;
+
     // Set to true while Spectre prompts are active so the keyboard thread
     // stops calling Console.ReadKey — otherwise it steals keystrokes from prompts.
     private volatile bool _promptActive;
+
+    private StreamWriter? _logWriter;
+
+    private const long   MaxLogBytes  = 5 * 1024 * 1024; // 5 MB
+    private const string LogFileName  = "logs.txt";
 
     public TuiDashboard(ProcessManager pm, RabbitMqMonitor rmq)
     {
         _pm  = pm;
         _rmq = rmq;
+    }
+
+    private void InitLogFile()
+    {
+        var fileMode = File.Exists(LogFileName) && new FileInfo(LogFileName).Length >= MaxLogBytes
+            ? FileMode.Create
+            : FileMode.Append;
+
+        _logWriter = new StreamWriter(
+            new FileStream(LogFileName, fileMode, FileAccess.Write, FileShare.Read))
+        {
+            AutoFlush = true,
+        };
+        _logWriter.WriteLine($"=== Session started: {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
     }
 
     public async Task RunAsync()
@@ -67,6 +92,7 @@ internal sealed class TuiDashboard
         Console.Write("\x1b[?1049h");
         AnsiConsole.Clear();
 
+        InitLogFile();
         StartKeyboardThread();
 
         try
@@ -88,8 +114,9 @@ internal sealed class TuiDashboard
 while (_pm.GlobalLog.TryDequeue(out var entry))
                         {
                             _logLines.Enqueue(entry);
-                                if (_logLines.Count > 20)
+                                if (_logLines.Count > LogHistory)
                                     _logLines.Dequeue();
+                            _logWriter?.WriteLine($"[{entry.Time}] [{entry.Role,-10}] {entry.Label}: {entry.Message}");
                             }
 
                             ctx.UpdateTarget(BuildLayout());
@@ -115,6 +142,8 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
         }
         finally
         {
+            _logWriter?.Dispose();
+            _logWriter = null;
             // Return to normal screen — previous terminal content is restored.
             Console.Write("\x1b[?1049l");
         }
@@ -146,6 +175,21 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
                 ConsoleKeyInfo key;
                 try   { key = Console.ReadKey(intercept: true); }
                 catch { break; }
+
+                // Arrow keys scroll the log without pausing the Live session
+                if (key.Key == ConsoleKey.UpArrow)
+                {
+                    var max = Math.Max(0, _logLines.Count - LogVisible);
+                    if (_logScrollOffset < max)
+                        _logScrollOffset++;
+                    continue;
+                }
+                if (key.Key == ConsoleKey.DownArrow)
+                {
+                    if (_logScrollOffset > 0)
+                        _logScrollOffset--;
+                    continue;
+                }
 
                 PendingCommand? cmd = key.KeyChar switch
                 {
@@ -347,7 +391,8 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             BuildLogPanel(),
             new Markup(
                 "\n[grey][[C]][/] Consumer  [grey][[S]][/] SlowConsumer  [grey][[P]][/] Publisher  [grey][[G]][/] GroupOrder" +
-                "    [grey][[K]][/] Graceful stop  [grey][[X]][/] Crash kill  [grey][[Z]][/] Pause/Resume  [grey][[Q]][/] Quit\n"),
+                "    [grey][[K]][/] Graceful stop  [grey][[X]][/] Crash kill  [grey][[Z]][/] Pause/Resume  [grey][[Q]][/] Quit" +
+                "    [grey][[↑/↓]][/] Scroll logs\n"),
         };
 
         return new Rows(rows);
@@ -452,7 +497,8 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
     private IRenderable BuildStatsPanel()
     {
-        var pub = _pm.Published;
+        var pub      = _pm.Published;
+        var processes = _pm.Snapshot();
 
         var table = new Table()
             .Title("[bold]Message Flow[/]")
@@ -479,6 +525,15 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             };
         }
 
+        // In-queue delta markup: published minus acked for this role
+        string inQ(WorkerRole r, long p, long c)
+        {
+            if (r == WorkerRole.Manager) return "[grey dim]N/A[/]";
+            var delta = p - c;
+            var col   = delta > 50 ? "red" : delta > 10 ? "yellow" : "grey";
+            return $"[{col}]{delta:+#;-#;0}[/]";
+        }
+
         table.AddRow(new Markup("[green]Published[/]"),
             new Markup(pub.Burger.ToString()), new Markup(pub.Fries.ToString()),
             new Markup(pub.Soda.ToString()), new Markup(pub.Total.ToString()),
@@ -486,34 +541,57 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
         table.AddEmptyRow();
 
-        // One row per consumer role that has produced at least one ack
+        // One section per consumer role that has produced at least one ack
         var consumerRoles = new[] { WorkerRole.LineCook, WorkerRole.Bartender, WorkerRole.Manager };
         foreach (var role in consumerRoles)
         {
-            if (!_pm.ConsumedByRole.TryGetValue(role, out var cons)) continue;
+            if (!_pm.ConsumedByRole.TryGetValue(role, out var roleTotals)) continue;
 
-            var color = RoleColor(role);
-            var label = role == WorkerRole.Manager
-                ? $"[{color}]{role} [grey dim](observer)[/][/]"
-                : $"[{color}]{role} (acked)[/]";
+            var color        = RoleColor(role);
+            var roleProcs    = processes.Where(p => p.Role == role).ToList();
+            var multiInstance = roleProcs.Count > 1;
 
-            // In-queue estimate = published − acked for this role's relevant items
-            // Manager is excluded from in-queue since it's an independent audit queue
-            string inQ(long p, long c)
+            if (multiInstance)
             {
-                if (role == WorkerRole.Manager) return "[grey dim]N/A[/]";
-                var delta = p - c;
-                var col   = delta > 50 ? "red" : delta > 10 ? "yellow" : "grey";
-                return $"[{col}]{delta:+#;-#;0}[/]";
-            }
+                // One row per running instance (indented)
+                foreach (var proc in roleProcs)
+                {
+                    var s = proc.Stats;
+                    table.AddRow(
+                        new Markup($"[{color}]  {Markup.Escape(proc.Label)} (acked)[/]"),
+                        new Markup($"[grey]{s.Burger}[/]"),
+                        new Markup($"[grey]{s.Fries}[/]"),
+                        new Markup($"[grey]{s.Soda}[/]"),
+                        new Markup($"{s.Total}"),
+                        new Markup("[grey]-[/]"));
+                }
 
-            table.AddRow(
-                new Markup(label),
-                new Markup($"[grey]{cons.Burger}[/]  {inQ(pub.Burger, cons.Burger)}"),
-                new Markup($"[grey]{cons.Fries}[/]  {inQ(pub.Fries, cons.Fries)}"),
-                new Markup($"[grey]{cons.Soda}[/]  {inQ(pub.Soda, cons.Soda)}"),
-                new Markup($"{cons.Total}"),
-                new Markup(queuedMarkup(role)));
+                // Sum row for the role
+                var sumLabel = role == WorkerRole.Manager
+                    ? $"[{color}]{role} [grey dim](observer)[/][/]"
+                    : $"[{color} bold]{role} (total)[/]";
+                table.AddRow(
+                    new Markup(sumLabel),
+                    new Markup($"[grey]{roleTotals.Burger}[/]  {inQ(role, pub.Burger, roleTotals.Burger)}"),
+                    new Markup($"[grey]{roleTotals.Fries}[/]  {inQ(role, pub.Fries, roleTotals.Fries)}"),
+                    new Markup($"[grey]{roleTotals.Soda}[/]  {inQ(role, pub.Soda, roleTotals.Soda)}"),
+                    new Markup($"[bold]{roleTotals.Total}[/]"),
+                    new Markup(queuedMarkup(role)));
+            }
+            else
+            {
+                // Single instance — keep original single-row display
+                var label = role == WorkerRole.Manager
+                    ? $"[{color}]{role} [grey dim](observer)[/][/]"
+                    : $"[{color}]{role} (acked)[/]";
+                table.AddRow(
+                    new Markup(label),
+                    new Markup($"[grey]{roleTotals.Burger}[/]  {inQ(role, pub.Burger, roleTotals.Burger)}"),
+                    new Markup($"[grey]{roleTotals.Fries}[/]  {inQ(role, pub.Fries, roleTotals.Fries)}"),
+                    new Markup($"[grey]{roleTotals.Soda}[/]  {inQ(role, pub.Soda, roleTotals.Soda)}"),
+                    new Markup($"{roleTotals.Total}"),
+                    new Markup(queuedMarkup(role)));
+            }
         }
 
         if (_pm.ConsumedByRole.IsEmpty)
@@ -524,10 +602,24 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
     private IRenderable BuildLogPanel()
     {
-        var entries = _logLines.ToArray();
+        var all    = _logLines.ToArray();
+        var total  = all.Length;
+
+        // Clamp scroll offset in case entries were discarded
+        var maxOffset = Math.Max(0, total - LogVisible);
+        if (_logScrollOffset > maxOffset)
+            _logScrollOffset = maxOffset;
+
+        var end     = total - _logScrollOffset;
+        var start   = Math.Max(0, end - LogVisible);
+        var entries = all[start..end];
+
+        var scrollInfo = total > LogVisible
+            ? $" [grey dim]({end}/{total}  ↑↓ scroll)[/]"
+            : "";
 
         var table = new Table()
-            .Title("[bold]Logs (last 20)[/]")
+            .Title($"[bold]Logs[/]{scrollInfo}")
             .BorderColor(Color.Grey23)
             .AddColumn(new TableColumn("[grey]Source[/]").NoWrap())
             .AddColumn(new TableColumn("[grey]Time[/]").NoWrap())

@@ -12,7 +12,7 @@ Before the kitchen opens, get your station ready.
 - [ ] **2. Open the Pass:** Start the TUI dashboard — `cd MassTransit.Hackathon.Dashboard && dotnet run`
 - [ ] **3. Inspect the Pantry:** Verify the broker is alive — navigate to [http://localhost:15672](http://localhost:15672) (login: `guest` / `guest`)
 - [ ] **4. Read the Recipe Book:** Quick walkthrough before we start — open and read [MASSTRANSIT-101.md](MASSTRANSIT-101.md)
-- [ ] **5. Grab the Chef's Notes:** Advanced reference for Tier 2+ — skim [MASSTRANSIT-102.md](MASSTRANSIT-102.md), come back when needed
+- [ ] **5. Grab the Chef's Notes:** Resilience & throughput reference — skim [MASSTRANSIT-102.md](MASSTRANSIT-102.md) for Tier 2/3, [MASSTRANSIT-103.md](MASSTRANSIT-103.md) for Tier 4/5, come back when needed
 
 > ✅ Once all five boxes are checked, you're ready to start cooking!
 

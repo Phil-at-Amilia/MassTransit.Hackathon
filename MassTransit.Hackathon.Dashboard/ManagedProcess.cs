@@ -29,4 +29,7 @@ internal sealed class ManagedProcess
 
     /// <summary>Rolling log buffer for this process (last 100 lines).</summary>
     public ConcurrentQueue<string> LogBuffer { get; } = new();
+
+    /// <summary>Per-instance message stats (acked counts for this process only).</summary>
+    public MessageStats Stats { get; } = new();
 }

@@ -260,7 +260,10 @@ internal sealed class ProcessManager
         else if (cleaned.Contains("Cooked ",    StringComparison.OrdinalIgnoreCase) ||
                  cleaned.Contains("Poured ",    StringComparison.OrdinalIgnoreCase) ||
                  cleaned.Contains("Saw order",  StringComparison.OrdinalIgnoreCase))
+        {
             ConsumedByRole.GetOrAdd(mp.Role, _ => new MessageStats()).Record(cleaned);
+            mp.Stats.Record(cleaned);
+        }
 
         var entry = new LogEntry(mp.Label, mp.Role, time, cleaned);
         Enqueue(mp.LogBuffer, entry.Message, max: 100);

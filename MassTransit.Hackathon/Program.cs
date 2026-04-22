@@ -59,6 +59,13 @@ await Host.CreateDefaultBuilder(args)
                     h.Password("guest");
                 });
 
+                // When --slow is set, force each receive endpoint to process one
+                // message at a time via RabbitMQ's channel-level QoS (PrefetchCount).
+                // The broker physically won't deliver the next message until the
+                // current one is acknowledged — no in-process overlap possible.
+                if (options.SlowMs > 0)
+                    cfg.PrefetchCount = 1;
+
                 cfg.ConfigureEndpoints(context);
             });
         });
