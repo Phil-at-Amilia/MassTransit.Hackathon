@@ -120,11 +120,7 @@ internal sealed class ProcessManager
         {
             var code = proc.HasExited ? proc.ExitCode : -1;
             AppendEvent(label, role, $"── EXITED (code {code}) ──");
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(5_000);
-                lock (_lock) _processes.Remove(managed);
-            });
+            // Keep the process in the list so its stats remain visible in the dashboard.
         };
 
         proc.Start();

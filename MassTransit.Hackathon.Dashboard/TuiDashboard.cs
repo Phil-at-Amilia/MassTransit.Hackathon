@@ -364,7 +364,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
                 }
 
                 var choiceMap = consumers.ToDictionary(
-                    p => $"#{p.Id}  {p.Label}  ({p.Role})  [{(p.IsPaused ? "PAUSED" : "Running")}]"
+                    p => $"#{p.Id}  {Markup.Escape(p.Label)}  ({p.Role})  [[{(p.IsPaused ? "PAUSED" : "Running")}]]"
                        + (p.SlowMs > 0 ? $"  slow={p.SlowMs}ms" : ""),
                     p => p);
 
@@ -431,7 +431,7 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
             var rate    = p.Role == WorkerRole.Publisher ? $"{p.RateSeconds}s" : "[grey]-[/]";
             var uptimeS = running
                 ? $"{(int)uptime.TotalMinutes:D2}:{uptime.Seconds:D2}"
-                : "[grey dim](exiting...)[/]";
+                : $"[grey dim]{(int)uptime.TotalMinutes:D2}:{uptime.Seconds:D2}[/]";
 
             table.AddRow(
                 p.Id.ToString(),
@@ -553,16 +553,21 @@ while (_pm.GlobalLog.TryDequeue(out var entry))
 
             if (multiInstance)
             {
-                // One row per running instance (indented)
+                // One row per instance (indented), dimmed if exited
                 foreach (var proc in roleProcs)
                 {
                     var s = proc.Stats;
+                    var dead = !proc.IsRunning;
+                    var lbl  = dead
+                        ? $"[grey dim]  {Markup.Escape(proc.Label)} (dead)[/]"
+                        : $"[{color}]  {Markup.Escape(proc.Label)} (acked)[/]";
+                    var c = dead ? "grey dim" : "grey";
                     table.AddRow(
-                        new Markup($"[{color}]  {Markup.Escape(proc.Label)} (acked)[/]"),
-                        new Markup($"[grey]{s.Burger}[/]"),
-                        new Markup($"[grey]{s.Fries}[/]"),
-                        new Markup($"[grey]{s.Soda}[/]"),
-                        new Markup($"{s.Total}"),
+                        new Markup(lbl),
+                        new Markup($"[{c}]{s.Burger}[/]"),
+                        new Markup($"[{c}]{s.Fries}[/]"),
+                        new Markup($"[{c}]{s.Soda}[/]"),
+                        new Markup(dead ? $"[grey dim]{s.Total}[/]" : $"{s.Total}"),
                         new Markup("[grey]-[/]"));
                 }
 

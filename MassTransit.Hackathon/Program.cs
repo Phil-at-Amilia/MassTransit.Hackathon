@@ -59,12 +59,38 @@ await Host.CreateDefaultBuilder(args)
                     h.Password("guest");
                 });
 
-                // When --slow is set, force each receive endpoint to process one
-                // message at a time via RabbitMQ's channel-level QoS (PrefetchCount).
-                // The broker physically won't deliver the next message until the
-                // current one is acknowledged — no in-process overlap possible.
+                // When --slow is set, manually configure the consumer endpoint with
+                // PrefetchCount=1 so RabbitMQ only delivers one message at a time.
+                // Bus-level PrefetchCount does NOT propagate to auto-configured endpoints,
+                // so we must configure the receive endpoint explicitly here.
+                // ConfigureEndpoints (below) will skip already-configured consumers.
                 if (options.SlowMs > 0)
-                    cfg.PrefetchCount = 1;
+                {
+                    if (isAll || (isConsumer && options.Type == "linecook"))
+                    {
+                        cfg.ReceiveEndpoint("LineCook", e =>
+                        {
+                            e.PrefetchCount = 1;
+                            e.ConfigureConsumer<LineCookConsumer>(context);
+                        });
+                    }
+                    if (isAll || (isConsumer && options.Type == "bartender"))
+                    {
+                        cfg.ReceiveEndpoint("Bartender", e =>
+                        {
+                            e.PrefetchCount = 1;
+                            e.ConfigureConsumer<BartenderConsumer>(context);
+                        });
+                    }
+                    if (isAll || (isConsumer && options.Type == "manager"))
+                    {
+                        cfg.ReceiveEndpoint("Manager", e =>
+                        {
+                            e.PrefetchCount = 1;
+                            e.ConfigureConsumer<ManagerConsumer>(context);
+                        });
+                    }
+                }
 
                 cfg.ConfigureEndpoints(context);
             });
