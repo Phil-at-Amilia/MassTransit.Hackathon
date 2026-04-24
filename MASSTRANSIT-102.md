@@ -12,6 +12,7 @@
 4. [Circuit Breaker](#4-circuit-breaker)
 5. [Concurrency Limit](#5-concurrency-limit)
 6. [Batch Consumer](#6-batch-consumer)
+7. [Durable Queues & Message Persistence](#7-durable-queues--message-persistence)
 
 ---
 
@@ -417,6 +418,132 @@ Publish 25 messages quickly, then wait:
 
 ---
 
+---
+
+## 7. Durable Queues & Message Persistence
+
+### The Problem: Messages Disappearing on Server Restart
+
+RabbitMQ supports two kinds of queues:
+
+| Property | Value | Effect |
+|----------|-------|--------|
+| **Durable** | `true` | The queue definition (name, bindings, arguments) **survives a broker restart** |
+| **Durable** | `false` | The queue is **wiped on restart** — all waiting messages are lost |
+| **AutoDelete** | `true` | The queue is **deleted the moment the last consumer disconnects** |
+| **AutoDelete** | `false` | The queue persists independently of connected consumers |
+
+> ⚠️ **The trap:** A durable queue still loses its messages if those messages were not published as **persistent**. Both the queue and the messages must be configured correctly to survive a restart.
+
+**Kitchen analogy:** `Durable = false` is like writing a ticket on a napkin — if the kitchen closes for the night (server reboot), the napkin is thrown away. `Durable = true` + persistent messages is a printed ticket in a fireproof order book.
+
+---
+
+### MassTransit Defaults
+
+When MassTransit auto-configures endpoints via `cfg.ConfigureEndpoints(context)`, it creates queues with:
+
+- `Durable = true` — queue definition survives restarts ✅
+- `AutoDelete = false` — queue is not deleted on consumer disconnect ✅
+- Messages published as **persistent** (`DeliveryMode = 2`) ✅
+
+These are safe defaults. **The risk arises when you override them explicitly** — for example, to create lightweight queues for local development or testing:
+
+```csharp
+// ⚠️ DO NOT use this in production — queue is deleted when consumers disconnect
+cfg.ReceiveEndpoint("line-cook-consumer", e =>
+{
+    e.AutoDelete = true;   // ← queue purged on server reboot / last consumer disconnect
+    e.Durable = false;     // ← queue definition lost on broker restart
+    e.ConfigureConsumer<LineCookConsumer>(context);
+});
+```
+
+---
+
+### How to Configure a Persisted Queue
+
+Always set both properties explicitly on any production `ReceiveEndpoint` to make your intent clear and prevent accidental misconfiguration:
+
+```csharp
+cfg.ReceiveEndpoint("line-cook-consumer", e =>
+{
+    // ✅ Queue survives broker restart AND consumer disconnects
+    e.Durable    = true;
+    e.AutoDelete = false;
+
+    e.ConfigureConsumer<LineCookConsumer>(context);
+});
+```
+
+If you rely on `ConfigureEndpoints`, the defaults are already safe — but adding explicit configuration documents the intent:
+
+```csharp
+// Program.cs — explicit durability for every endpoint
+x.UsingRabbitMq((context, cfg) =>
+{
+    cfg.Host("localhost", "/", h =>
+    {
+        h.Username("guest");
+        h.Password("guest");
+    });
+
+    // Apply safe durability defaults to ALL auto-configured endpoints
+    cfg.ConfigureEndpoints(context, new DefaultEndpointNameFormatter("", false));
+
+    // Or configure individually:
+    cfg.ReceiveEndpoint("line-cook-consumer", e =>
+    {
+        e.Durable    = true;   // ✅ survive broker restart
+        e.AutoDelete = false;  // ✅ survive consumer disconnect
+
+        e.ConfigureConsumer<LineCookConsumer>(context);
+    });
+});
+```
+
+---
+
+### Message Persistence vs. Queue Durability
+
+A durable queue is a necessary but not sufficient condition for surviving a restart. Messages must also be published as **persistent**.
+
+MassTransit sets `DeliveryMode.Persistent` by default. If you ever publish directly via the RabbitMQ client or another library, make sure to set `IBasicProperties.Persistent = true` (or `DeliveryMode = 2`):
+
+```
+Queue durable = true  +  Message persistent = true  →  Messages survive restart ✅
+Queue durable = true  +  Message persistent = false →  Messages lost on restart ⚠️
+Queue durable = false +  Message persistent = true  →  Queue (and messages) lost ⚠️
+```
+
+> 💡 MassTransit handles message persistence automatically — you only need to worry about this if you're mixing MassTransit with direct AMQP code.
+
+---
+
+### Verifying Queue Durability in the RabbitMQ UI
+
+1. Open [http://localhost:15672](http://localhost:15672) → **Queues** tab.
+2. Find your queue (e.g., `line-cook-consumer`).
+3. Check the **Features** column:
+   - **D** = Durable ✅
+   - **AD** = AutoDelete ⚠️ (will be purged on disconnect)
+   - **Excl** = Exclusive (single-connection only, also lost on disconnect)
+4. Click on the queue → scroll to **Overview** — the `durable` field should be `true`.
+
+> 💡 After changing `Durable` or `AutoDelete`, you must **delete the existing queue** in the UI before restarting the app. RabbitMQ will refuse to re-declare a queue with different properties and the consumer will fail to start with a `406 PRECONDITION_FAILED` error.
+
+---
+
+### Key Points
+
+- `Durable = true` + `AutoDelete = false` = queue and messages survive server reboots and consumer restarts.
+- MassTransit's **default settings are safe** — only override them intentionally.
+- Always verify in the RabbitMQ UI that your production queues show the **D** (durable) feature flag.
+- If you change durability settings on an existing queue, delete the old queue first to avoid a `PRECONDITION_FAILED` mismatch error.
+- For the `_error` queue: MassTransit also creates it as durable, so failed messages are safe across restarts.
+
+---
+
 ## Achievement Cheat Sheet
 
 | Achievement | Concept | Section |
@@ -428,3 +555,4 @@ Publish 25 messages quickly, then wait:
 | **#9** The Kitchen Fire | Circuit Breaker | [§4 Circuit Breaker](#4-circuit-breaker) |
 | **#12** The Head Chef | Concurrency Limit | [§5 Concurrency Limit](#5-concurrency-limit) |
 | **#13** Batch Order | Batch Consumer | [§6 Batch Consumer](#6-batch-consumer) |
+| — | Durable Queues | [§7 Durable Queues & Message Persistence](#7-durable-queues--message-persistence) |
